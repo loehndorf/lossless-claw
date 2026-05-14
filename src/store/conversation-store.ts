@@ -32,6 +32,7 @@ export type CreateMessageInput = {
   content: string;
   tokenCount: number;
   identityHash?: string;
+  source?: MessageSourceIdentity;
 };
 
 export type MessageRecord = {
@@ -42,6 +43,31 @@ export type MessageRecord = {
   content: string;
   tokenCount: number;
   createdAt: Date;
+  sourceProvider: string | null;
+  sourceChannelId: string | null;
+  sourceThreadId: string | null;
+  sourceMessageId: string | null;
+};
+
+export type MessageSourceIdentity = {
+  provider?: string | null;
+  channelId?: string | null;
+  threadId?: string | null;
+  messageId?: string | null;
+};
+
+export type MessageSourceQuery = MessageSourceIdentity & {
+  conversationId?: ConversationId;
+  limit?: number;
+};
+
+export type SourceScopeDeletionInput = {
+  provider?: string | null;
+  channelId?: string | null;
+  threadId?: string | null;
+  scopeType: "channel" | "thread";
+  reason?: string | null;
+  purgeAfter?: Date | null;
 };
 
 export type CreateMessagePartInput = {
@@ -132,6 +158,10 @@ interface MessageRow {
   content: string;
   token_count: number;
   created_at: string;
+  source_provider?: string | null;
+  source_channel_id?: string | null;
+  source_thread_id?: string | null;
+  source_message_id?: string | null;
 }
 
 interface MessageSearchRow {
@@ -190,7 +220,29 @@ function toMessageRecord(row: MessageRow): MessageRecord {
     content: row.content,
     tokenCount: row.token_count,
     createdAt: parseUtcTimestamp(row.created_at),
+    sourceProvider: row.source_provider ?? null,
+    sourceChannelId: row.source_channel_id ?? null,
+    sourceThreadId: row.source_thread_id ?? null,
+    sourceMessageId: row.source_message_id ?? null,
   };
+}
+
+function normalizeSourceField(value: string | null | undefined): string | null {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeSourceIdentity(source: MessageSourceIdentity | undefined): Required<MessageSourceIdentity> {
+  return {
+    provider: normalizeSourceField(source?.provider),
+    channelId: normalizeSourceField(source?.channelId),
+    threadId: normalizeSourceField(source?.threadId),
+    messageId: normalizeSourceField(source?.messageId),
+  };
+}
+
+function escapeSqlLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 function toSearchResult(row: MessageSearchRow): MessageSearchResult {
@@ -266,6 +318,9 @@ function normalizeMessageContentForFullTextIndex(content: string): string | null
 
 export class ConversationStore {
   private readonly fts5Available: boolean;
+  private readonly messageSelectColumns =
+    `message_id, conversation_id, seq, role, content, token_count, created_at,
+     source_provider, source_channel_id, source_thread_id, source_message_id`;
 
   constructor(
     private db: DatabaseSync,
@@ -449,16 +504,45 @@ export class ConversationStore {
       .run(conversationId);
   }
 
+  async archiveConversations(conversationIds: ConversationId[]): Promise<number> {
+    const uniqueIds = Array.from(new Set(conversationIds.filter((id) => Number.isInteger(id))));
+    if (uniqueIds.length === 0) {
+      return 0;
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE conversations
+         SET active = 0,
+             archived_at = COALESCE(archived_at, datetime('now')),
+             updated_at = datetime('now')
+         WHERE conversation_id IN (${uniqueIds.map(() => "?").join(",")})`,
+      )
+      .run(...uniqueIds);
+    return Number(result.changes ?? 0);
+  }
+
   // ── Message operations ────────────────────────────────────────────────────
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const identityHash = input.identityHash ?? buildMessageIdentityHash(input.role, input.content);
+    const source = normalizeSourceIdentity(input.source);
 
     // Use INSERT OR IGNORE to handle UNIQUE constraint violations gracefully
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO messages (
+           conversation_id,
+           seq,
+           role,
+           content,
+           token_count,
+           identity_hash,
+           source_provider,
+           source_channel_id,
+           source_thread_id,
+           source_message_id
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.conversationId,
@@ -467,6 +551,10 @@ export class ConversationStore {
         input.content,
         input.tokenCount,
         identityHash,
+        source.provider,
+        source.channelId,
+        source.threadId,
+        source.messageId,
       );
 
     const changes = result.changes ?? 0;
@@ -475,14 +563,15 @@ export class ConversationStore {
     if (changes === 0) {
       const existingRow = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+          `SELECT ${this.messageSelectColumns}
          FROM messages WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?
          LIMIT 1`,
         )
         .get(input.conversationId, identityHash, input.role, input.content) as unknown as MessageRow | undefined;
 
       if (existingRow) {
-        return toMessageRecord(existingRow);
+        this.updateMessageSourceIfMissing(existingRow.message_id, input.source);
+        return (await this.getMessageById(existingRow.message_id)) ?? toMessageRecord(existingRow);
       }
 
       throw new Error(
@@ -497,7 +586,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT ${this.messageSelectColumns}
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -516,6 +605,10 @@ export class ConversationStore {
       content: input.content,
       tokenCount: input.tokenCount,
       createdAt: new Date(),
+      sourceProvider: source.provider,
+      sourceChannelId: source.channelId,
+      sourceThreadId: source.threadId,
+      sourceMessageId: source.messageId,
     };
   }
 
@@ -524,16 +617,28 @@ export class ConversationStore {
       return [];
     }
     const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (
+         conversation_id,
+         seq,
+         role,
+         content,
+         token_count,
+         identity_hash,
+         source_provider,
+         source_channel_id,
+         source_thread_id,
+         source_message_id
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+      `SELECT ${this.messageSelectColumns}
        FROM messages WHERE message_id = ?`,
     );
 
     const records: MessageRecord[] = [];
     for (const input of inputs) {
+      const source = normalizeSourceIdentity(input.source);
       const result = insertStmt.run(
         input.conversationId,
         input.seq,
@@ -541,6 +646,10 @@ export class ConversationStore {
         input.content,
         input.tokenCount,
         input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+        source.provider,
+        source.channelId,
+        source.threadId,
+        source.messageId,
       );
 
       const messageId = Number(result.lastInsertRowid);
@@ -562,7 +671,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+          `SELECT ${this.messageSelectColumns}
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -574,7 +683,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT ${this.messageSelectColumns}
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -586,7 +695,7 @@ export class ConversationStore {
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT ${this.messageSelectColumns}
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -635,7 +744,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+        `SELECT ${this.messageSelectColumns}
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -721,6 +830,104 @@ export class ConversationStore {
     return row?.max_seq ?? 0;
   }
 
+  async listMessagesAfterSeq(conversationId: ConversationId, seq: number): Promise<MessageRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT ${this.messageSelectColumns}
+         FROM messages
+         WHERE conversation_id = ? AND seq >= ?
+         ORDER BY seq`,
+      )
+      .all(conversationId, Math.floor(seq)) as unknown as MessageRow[];
+    return rows.map(toMessageRecord);
+  }
+
+  async findMessagesBySource(input: MessageSourceQuery): Promise<MessageRecord[]> {
+    const source = normalizeSourceIdentity(input);
+    if (!source.messageId) {
+      return [];
+    }
+
+    const where = ["source_message_id = ?"];
+    const args: Array<string | number> = [source.messageId];
+    if (input.conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(input.conversationId);
+    }
+    if (source.provider) {
+      where.push("source_provider = ?");
+      args.push(source.provider);
+    }
+    if (source.channelId) {
+      where.push("source_channel_id = ?");
+      args.push(source.channelId);
+    }
+    if (source.threadId) {
+      where.push("source_thread_id = ?");
+      args.push(source.threadId);
+    }
+
+    args.push(Math.max(1, Math.floor(input.limit ?? 100)));
+    const rows = this.db
+      .prepare(
+        `SELECT ${this.messageSelectColumns}
+         FROM messages
+         WHERE ${where.join(" AND ")}
+         ORDER BY conversation_id, seq
+         LIMIT ?`,
+      )
+      .all(...args) as unknown as MessageRow[];
+    return rows.map(toMessageRecord);
+  }
+
+  async findMessagesContainingSourceMessageId(input: {
+    conversationId?: ConversationId;
+    messageId: string;
+    limit?: number;
+  }): Promise<MessageRecord[]> {
+    const messageId = normalizeSourceField(input.messageId);
+    if (!messageId) {
+      return [];
+    }
+    const where = ["content LIKE ? ESCAPE '\\'"];
+    const args: Array<string | number> = [`%${escapeSqlLike(messageId)}%`];
+    if (input.conversationId != null) {
+      where.push("conversation_id = ?");
+      args.push(input.conversationId);
+    }
+    args.push(Math.max(1, Math.floor(input.limit ?? 100)));
+
+    const rows = this.db
+      .prepare(
+        `SELECT ${this.messageSelectColumns}
+         FROM messages
+         WHERE ${where.join(" AND ")}
+         ORDER BY conversation_id, seq
+         LIMIT ?`,
+      )
+      .all(...args) as unknown as MessageRow[];
+    return rows
+      .filter((row) => row.content.includes(messageId))
+      .map(toMessageRecord);
+  }
+
+  private updateMessageSourceIfMissing(messageId: MessageId, sourceInput: MessageSourceIdentity | undefined): void {
+    const source = normalizeSourceIdentity(sourceInput);
+    if (!source.provider && !source.channelId && !source.threadId && !source.messageId) {
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE messages
+         SET source_provider = COALESCE(source_provider, ?),
+             source_channel_id = COALESCE(source_channel_id, ?),
+             source_thread_id = COALESCE(source_thread_id, ?),
+             source_message_id = COALESCE(source_message_id, ?)
+         WHERE message_id = ?`,
+      )
+      .run(source.provider, source.channelId, source.threadId, source.messageId, messageId);
+  }
+
   // ── Deletion ──────────────────────────────────────────────────────────────
 
   /**
@@ -758,6 +965,101 @@ export class ConversationStore {
     }
 
     return deleted;
+  }
+
+  async recordSourceScopeDeletion(input: SourceScopeDeletionInput): Promise<void> {
+    const channelId = normalizeSourceField(input.channelId);
+    const threadId = normalizeSourceField(input.threadId);
+    if (input.scopeType === "channel" && !channelId) {
+      return;
+    }
+    if (input.scopeType === "thread" && !threadId) {
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO source_scope_deletions (
+           provider,
+           channel_id,
+           thread_id,
+           scope_type,
+           reason,
+           purge_after
+         )
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        normalizeSourceField(input.provider),
+        channelId,
+        threadId,
+        input.scopeType,
+        normalizeSourceField(input.reason),
+        input.purgeAfter?.toISOString() ?? null,
+      );
+  }
+
+  async listConversationIdsInSourceScope(input: SourceScopeDeletionInput): Promise<ConversationId[]> {
+    const channelId = normalizeSourceField(input.channelId);
+    const threadId = normalizeSourceField(input.threadId);
+    const provider = normalizeSourceField(input.provider);
+    const ids = new Set<ConversationId>();
+
+    if (input.scopeType === "thread" && !threadId) {
+      return [];
+    }
+    if (input.scopeType === "channel" && !channelId) {
+      return [];
+    }
+
+    const messageWhere: string[] = [];
+    const messageArgs: Array<string | number> = [];
+    if (provider) {
+      messageWhere.push("source_provider = ?");
+      messageArgs.push(provider);
+    }
+    if (input.scopeType === "thread") {
+      messageWhere.push("source_thread_id = ?");
+      messageArgs.push(threadId!);
+    } else {
+      messageWhere.push("source_channel_id = ?");
+      messageArgs.push(channelId!);
+    }
+    const messageRows = this.db
+      .prepare(
+        `SELECT DISTINCT conversation_id
+         FROM messages
+         WHERE ${messageWhere.join(" AND ")}`,
+      )
+      .all(...messageArgs) as Array<{ conversation_id: number }>;
+    for (const row of messageRows) {
+      ids.add(row.conversation_id);
+    }
+
+    const sessionWhere: string[] = [];
+    const sessionArgs: string[] = [];
+    if (input.scopeType === "thread") {
+      sessionWhere.push("session_key LIKE ?");
+      sessionArgs.push(`agent:%:discord:channel:%:topic:${threadId}`);
+    } else {
+      sessionWhere.push("(session_key LIKE ? OR session_key LIKE ?)");
+      sessionArgs.push(
+        `agent:%:discord:channel:${channelId}`,
+        `agent:%:discord:channel:${channelId}:%`,
+      );
+    }
+    const sessionRows = this.db
+      .prepare(
+        `SELECT conversation_id
+         FROM conversations
+         WHERE session_key IS NOT NULL
+           AND ${sessionWhere.join(" AND ")}`,
+      )
+      .all(...sessionArgs) as Array<{ conversation_id: number }>;
+    for (const row of sessionRows) {
+      ids.add(row.conversation_id);
+    }
+
+    return Array.from(ids).sort((left, right) => left - right);
   }
 
   // ── Search ────────────────────────────────────────────────────────────────
