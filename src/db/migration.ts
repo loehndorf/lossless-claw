@@ -263,57 +263,6 @@ function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   }
 }
 
-function ensureMessageSourceColumns(db: DatabaseSync): void {
-  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
-  const hasColumn = (name: string) => messageColumns.some((col) => col.name === name);
-  if (!hasColumn("source_provider")) {
-    db.exec(`ALTER TABLE messages ADD COLUMN source_provider TEXT`);
-  }
-  if (!hasColumn("source_channel_id")) {
-    db.exec(`ALTER TABLE messages ADD COLUMN source_channel_id TEXT`);
-  }
-  if (!hasColumn("source_thread_id")) {
-    db.exec(`ALTER TABLE messages ADD COLUMN source_thread_id TEXT`);
-  }
-  if (!hasColumn("source_message_id")) {
-    db.exec(`ALTER TABLE messages ADD COLUMN source_message_id TEXT`);
-  }
-}
-
-function ensureSourceDeletionTables(db: DatabaseSync): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS source_deletions (
-      deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      provider TEXT,
-      channel_id TEXT,
-      thread_id TEXT,
-      message_id TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(provider, channel_id, thread_id, message_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS source_scope_deletions (
-      deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      provider TEXT,
-      channel_id TEXT,
-      thread_id TEXT,
-      scope_type TEXT NOT NULL CHECK (scope_type IN ('channel', 'thread')),
-      reason TEXT,
-      purge_after TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE INDEX IF NOT EXISTS messages_source_lookup_idx
-      ON messages (source_message_id, source_provider, source_channel_id, source_thread_id);
-    CREATE INDEX IF NOT EXISTS messages_source_scope_idx
-      ON messages (source_channel_id, source_thread_id);
-    CREATE INDEX IF NOT EXISTS source_deletions_message_idx
-      ON source_deletions (message_id, provider, channel_id, thread_id);
-    CREATE INDEX IF NOT EXISTS source_scope_deletions_scope_idx
-      ON source_scope_deletions (scope_type, channel_id, thread_id, provider);
-  `);
-}
-
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -904,33 +853,8 @@ export function runLcmMigrations(
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       identity_hash TEXT,
-      source_provider TEXT,
-      source_channel_id TEXT,
-      source_thread_id TEXT,
-      source_message_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
-    );
-
-    CREATE TABLE IF NOT EXISTS source_deletions (
-      deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      provider TEXT,
-      channel_id TEXT,
-      thread_id TEXT,
-      message_id TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(provider, channel_id, thread_id, message_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS source_scope_deletions (
-      deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      provider TEXT,
-      channel_id TEXT,
-      thread_id TEXT,
-      scope_type TEXT NOT NULL CHECK (scope_type IN ('channel', 'thread')),
-      reason TEXT,
-      purge_after TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS summaries (
@@ -1095,10 +1019,6 @@ export function runLcmMigrations(
 
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
-    CREATE INDEX IF NOT EXISTS source_deletions_message_idx
-      ON source_deletions (message_id, provider, channel_id, thread_id);
-    CREATE INDEX IF NOT EXISTS source_scope_deletions_scope_idx
-      ON source_scope_deletions (scope_type, channel_id, thread_id, provider);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
     CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
@@ -1163,12 +1083,6 @@ export function runLcmMigrations(
     runMigrationStep("ensureSummaryModelColumn", log, () => ensureSummaryModelColumn(db));
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
-    );
-    runMigrationStep("ensureMessageSourceColumns", log, () =>
-      ensureMessageSourceColumns(db),
-    );
-    runMigrationStep("ensureSourceDeletionTables", log, () =>
-      ensureSourceDeletionTables(db),
     );
     // Belt-and-suspenders: ensure message_parts exists even if the bulk
     // CREATE TABLE block above was interrupted before reaching it.

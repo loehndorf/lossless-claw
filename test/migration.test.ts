@@ -444,12 +444,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       name?: string;
     }>;
     expect(messageColumns.some((column) => column.name === "identity_hash")).toBe(true);
-    expect(messageColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
-      "source_provider",
-      "source_channel_id",
-      "source_thread_id",
-      "source_message_id",
-    ]));
 
     const row = db
       .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
@@ -470,14 +464,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       "conversation_id",
       "identity_hash",
     ]);
-
-    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{
-      name?: string;
-    }>;
-    expect(tables.map((table) => table.name)).toEqual(expect.arrayContaining([
-      "source_deletions",
-      "source_scope_deletions",
-    ]));
   });
 
   it("backfills message identity hashes across multiple batches", () => {
