@@ -11,6 +11,9 @@ import type {
 } from "./store/summary-store.js";
 import type { SearchSort } from "./store/full-text-sort.js";
 import { estimateTokens } from "./estimate-tokens.js";
+import type { VectorSearchConfig } from "./db/config.js";
+import type { EmbeddingProvider } from "./embeddings.js";
+import { EmbeddingStore } from "./embeddings.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -64,7 +67,7 @@ export interface DescribeResult {
 
 export interface GrepInput {
   query: string;
-  mode: "regex" | "full_text";
+  mode: "regex" | "full_text" | "semantic";
   scope: "messages" | "summaries" | "both";
   conversationId?: number;
   since?: Date;
@@ -128,6 +131,11 @@ export class RetrievalEngine {
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
+    private vectorSearch?: {
+      config: VectorSearchConfig;
+      store: EmbeddingStore;
+      provider: EmbeddingProvider;
+    },
   ) {}
 
   // ── describe ─────────────────────────────────────────────────────────────
@@ -249,6 +257,19 @@ export class RetrievalEngine {
   async grep(input: GrepInput): Promise<GrepResult> {
     const { query, mode, scope, conversationId, since, before, limit, sort, allowedConversationIds, includeDeletedScopes } = input;
 
+    if (mode === "semantic") {
+      return this.semanticGrep({
+        query,
+        scope,
+        conversationId,
+        since,
+        before,
+        limit,
+        allowedConversationIds,
+        includeDeletedScopes,
+      });
+    }
+
     const searchInput = { query, mode, conversationId, since, before, limit, sort, allowedConversationIds, includeDeletedScopes };
 
     let messages: MessageSearchResult[] = [];
@@ -270,6 +291,44 @@ export class RetrievalEngine {
       messages,
       summaries,
       totalMatches: messages.length + summaries.length,
+    };
+  }
+
+  private async semanticGrep(input: {
+    query: string;
+    scope: "messages" | "summaries" | "both";
+    conversationId?: number;
+    since?: Date;
+    before?: Date;
+    limit?: number;
+    allowedConversationIds?: number[];
+    includeDeletedScopes?: boolean;
+  }): Promise<GrepResult> {
+    if (!this.vectorSearch?.config.enabled || input.scope === "messages") {
+      return { messages: [], summaries: [], totalMatches: 0 };
+    }
+    const config = this.vectorSearch.config;
+    if (config.scope === "messages") {
+      return { messages: [], summaries: [], totalMatches: 0 };
+    }
+    const [queryVector] = await this.vectorSearch.provider.embed([input.query]);
+    if (!queryVector || queryVector.length === 0) {
+      return { messages: [], summaries: [], totalMatches: 0 };
+    }
+    const model = this.vectorSearch.store.ensureModel(config, queryVector.length);
+    const summaries = this.vectorSearch.store.searchSummaryEmbeddings({
+      embeddingModelId: model.embeddingModelId,
+      queryVector,
+      limit: input.limit ?? config.maxCandidates,
+      conversationId: input.conversationId,
+      allowedConversationIds: input.allowedConversationIds,
+      since: input.since,
+      before: input.before,
+    });
+    return {
+      messages: [],
+      summaries,
+      totalMatches: summaries.length,
     };
   }
 

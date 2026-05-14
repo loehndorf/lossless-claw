@@ -30,16 +30,18 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 ### lcm_grep
 
-Search across messages and/or summaries using regex or full-text search.
+Search across messages and/or summaries using regex, full-text search, or optional semantic search.
 
 Use `mode: "full_text"` for keyword or topical recall. Wrap exact multi-word phrases in quotes to preserve phrase matching. Keep the default `sort: "recency"` for recent events, switch to `sort: "relevance"` when looking for the best older match on a topic, and use `sort: "hybrid"` when you want relevance without giving up recency entirely.
+
+Use `mode: "semantic"` only when `vectorSearch.enabled` is configured. Semantic mode currently searches summary embeddings only. It still applies the same conversation scope and visibility scope as lexical summary search.
 
 **Parameters:**
 
 | Param | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `pattern` | string | ✅ | — | Search pattern |
-| `mode` | string | | `"regex"` | `"regex"` or `"full_text"` |
+| `mode` | string | | `"regex"` | `"regex"`, `"full_text"`, or `"semantic"` |
 | `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
 | `conversationId` | number | | current | Specific conversation to search |
 | `allConversations` | boolean | | `false` | Search all conversations |
@@ -67,6 +69,9 @@ lcm_grep(pattern: "\"error handling\" retries", mode: "full_text", sort: "releva
 
 # Regex search in summaries only
 lcm_grep(pattern: "config\\.threshold.*0\\.[0-9]+", scope: "summaries")
+
+# Semantic search, when vectorSearch is enabled
+lcm_grep(pattern: "why did migrations fail", mode: "semantic", scope: "summaries")
 
 # Recent messages containing a specific term
 lcm_grep(pattern: "deployment", since: "2026-02-19T00:00:00Z", scope: "messages")

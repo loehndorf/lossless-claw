@@ -707,6 +707,41 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("ships a manifest with vectorSearch in schema", () => {
+    expect(manifest.configSchema.properties.vectorSearch).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+          default: false,
+        },
+        provider: {
+          type: "string",
+          default: "ollama",
+        },
+        model: {
+          type: "string",
+          default: "bge-m3",
+        },
+        dimensions: {
+          type: "integer",
+          minimum: 1,
+        },
+        scope: {
+          type: "string",
+          default: "summaries",
+          enum: ["summaries", "messages", "both"],
+        },
+        store: {
+          type: "string",
+          default: "sqlite",
+          enum: ["sqlite"],
+        },
+      },
+    });
+  });
+
   it("ships a manifest with plugin-config schema entries for runtime token controls", () => {
     expect(manifest.configSchema.properties.leafTargetTokens).toEqual({
       type: "integer",

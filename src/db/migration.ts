@@ -255,6 +255,49 @@ function ensureSessionRootSummariesTable(db: DatabaseSync): void {
   `);
 }
 
+function ensureEmbeddingTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_models (
+      embedding_model_id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      base_url TEXT,
+      config_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS embeddings (
+      target_type TEXT NOT NULL CHECK (target_type IN ('message', 'summary', 'large_file')),
+      target_id TEXT NOT NULL,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      embedding_model_id TEXT NOT NULL REFERENCES embedding_models(embedding_model_id) ON DELETE CASCADE,
+      content_hash TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (target_type, target_id, embedding_model_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_queue (
+      target_type TEXT NOT NULL CHECK (target_type IN ('message', 'summary', 'large_file')),
+      target_id TEXT NOT NULL,
+      embedding_model_id TEXT NOT NULL REFERENCES embedding_models(embedding_model_id) ON DELETE CASCADE,
+      reason TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (target_type, target_id, embedding_model_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS embeddings_model_type_idx
+      ON embeddings (embedding_model_id, target_type, conversation_id);
+    CREATE INDEX IF NOT EXISTS embeddings_content_hash_idx ON embeddings (content_hash);
+    CREATE INDEX IF NOT EXISTS embedding_queue_requested_idx
+      ON embedding_queue (embedding_model_id, requested_at);
+  `);
+}
+
 function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
   const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
   const hasIdentityHash = messageColumns.some((col) => col.name === "identity_hash");
@@ -1010,6 +1053,39 @@ export function runLcmMigrations(
       model TEXT NOT NULL DEFAULT 'unknown'
     );
 
+    CREATE TABLE IF NOT EXISTS embedding_models (
+      embedding_model_id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      base_url TEXT,
+      config_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS embeddings (
+      target_type TEXT NOT NULL CHECK (target_type IN ('message', 'summary', 'large_file')),
+      target_id TEXT NOT NULL,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      embedding_model_id TEXT NOT NULL REFERENCES embedding_models(embedding_model_id) ON DELETE CASCADE,
+      content_hash TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (target_type, target_id, embedding_model_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_queue (
+      target_type TEXT NOT NULL CHECK (target_type IN ('message', 'summary', 'large_file')),
+      target_id TEXT NOT NULL,
+      embedding_model_id TEXT NOT NULL REFERENCES embedding_models(embedding_model_id) ON DELETE CASCADE,
+      reason TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (target_type, target_id, embedding_model_id)
+    );
+
     CREATE TABLE IF NOT EXISTS lcm_migration_state (
       step_name TEXT NOT NULL,
       algorithm_version INTEGER NOT NULL,
@@ -1032,6 +1108,11 @@ export function runLcmMigrations(
       ON conversation_compaction_telemetry (cache_state, updated_at);
     CREATE INDEX IF NOT EXISTS session_root_summaries_stale_idx
       ON session_root_summaries (stale, updated_at);
+    CREATE INDEX IF NOT EXISTS embeddings_model_type_idx
+      ON embeddings (embedding_model_id, target_type, conversation_id);
+    CREATE INDEX IF NOT EXISTS embeddings_content_hash_idx ON embeddings (content_hash);
+    CREATE INDEX IF NOT EXISTS embedding_queue_requested_idx
+      ON embedding_queue (embedding_model_id, requested_at);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
@@ -1090,6 +1171,7 @@ export function runLcmMigrations(
     runMigrationStep("ensureSessionRootSummariesTable", log, () =>
       ensureSessionRootSummariesTable(db),
     );
+    runMigrationStep("ensureEmbeddingTables", log, () => ensureEmbeddingTables(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
     );

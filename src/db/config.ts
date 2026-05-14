@@ -90,6 +90,33 @@ export type NightlyCompactionConfig = {
   forceFreshTail: boolean;
 };
 
+export type VectorSearchConfig = {
+  /** Enable optional semantic/vector retrieval. Disabled by default. */
+  enabled: boolean;
+  /** Embedding provider id, e.g. ollama, openai, openrouter, or a configured OpenAI-compatible provider. */
+  provider: string;
+  /** Embedding model id. Local default is Ollama bge-m3. */
+  model: string;
+  /** Optional provider base URL for local/proxy/OpenAI-compatible embedding endpoints. */
+  baseUrl?: string;
+  /** Expected embedding dimensions. Used to detect stale/mismatched vectors. */
+  dimensions?: number;
+  /** Which LCM artifacts to embed/search semantically. */
+  scope: "summaries" | "messages" | "both";
+  /** Vector store backend. MVP uses SQLite JSON vectors; native vector extensions can be added later. */
+  store: "sqlite";
+  /** Vector contribution for future hybrid ranking. */
+  hybridWeight: number;
+  /** Maximum semantic candidates to score before truncating to the tool limit. */
+  maxCandidates: number;
+  /** Number of pending embedding jobs to process per maintenance batch. */
+  indexBatchSize: number;
+  /** Timeout for embedding provider requests. */
+  timeoutMs: number;
+  /** Bearer token/API key for remote embedding providers. Prefer env/secret refs in production. */
+  apiKey?: string;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -165,6 +192,8 @@ export type LcmConfig = {
   rootSummary: RootSummaryConfig;
   /** Built-in background nightly compaction sweep. */
   nightlyCompaction: NightlyCompactionConfig;
+  /** Optional semantic/vector retrieval configuration. */
+  vectorSearch: VectorSearchConfig;
   /** Deprecated alias for nightlyCompaction.hour. */
   nightlyCompactHour: number;
   /** Backfill configuration for importing historical messages. */
@@ -320,6 +349,13 @@ function toRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function toVectorSearchScope(value: unknown): VectorSearchConfig["scope"] | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  return normalized === "summaries" || normalized === "messages" || normalized === "both"
+    ? normalized
+    : undefined;
+}
+
 function parseEnvStrArray(value: string | undefined): string[] | undefined {
   if (value === undefined) {
     return undefined;
@@ -383,6 +419,7 @@ export function resolveLcmConfigWithDiagnostics(
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
   const rootSummary = toRecord(pc.rootSummary);
   const nightlyCompaction = toRecord(pc.nightlyCompaction);
+  const vectorSearch = toRecord(pc.vectorSearch);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
@@ -627,6 +664,69 @@ export function resolveLcmConfigWithDiagnostics(
           env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL !== undefined
             ? env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL === "true"
             : toBool(nightlyCompaction?.forceFreshTail) ?? true,
+      },
+      vectorSearch: {
+        enabled:
+          env.LCM_VECTOR_SEARCH_ENABLED !== undefined
+            ? env.LCM_VECTOR_SEARCH_ENABLED === "true"
+            : toBool(vectorSearch?.enabled) ?? false,
+        provider:
+          env.LCM_EMBEDDING_PROVIDER?.trim()
+            ?? env.LCM_VECTOR_SEARCH_PROVIDER?.trim()
+            ?? toStr(vectorSearch?.provider)
+            ?? "ollama",
+        model:
+          env.LCM_EMBEDDING_MODEL?.trim()
+            ?? env.LCM_VECTOR_SEARCH_MODEL?.trim()
+            ?? toStr(vectorSearch?.model)
+            ?? "bge-m3",
+        baseUrl:
+          env.LCM_EMBEDDING_BASE_URL?.trim()
+            ?? env.LCM_VECTOR_SEARCH_BASE_URL?.trim()
+            ?? toStr(vectorSearch?.baseUrl)
+            ?? undefined,
+        dimensions:
+          parseFiniteInt(env.LCM_EMBEDDING_DIMENSIONS)
+            ?? parseFiniteInt(env.LCM_VECTOR_SEARCH_DIMENSIONS)
+            ?? toNumber(vectorSearch?.dimensions)
+            ?? undefined,
+        scope:
+          toVectorSearchScope(env.LCM_VECTOR_SEARCH_SCOPE)
+            ?? toVectorSearchScope(vectorSearch?.scope)
+            ?? "summaries",
+        store: "sqlite",
+        hybridWeight: Math.min(
+          1,
+          Math.max(
+            0,
+            parseFiniteNumber(env.LCM_VECTOR_SEARCH_HYBRID_WEIGHT)
+              ?? toNumber(vectorSearch?.hybridWeight)
+              ?? 0.35,
+          ),
+        ),
+        maxCandidates: Math.max(
+          1,
+          parseFiniteInt(env.LCM_VECTOR_SEARCH_MAX_CANDIDATES)
+            ?? toNumber(vectorSearch?.maxCandidates)
+            ?? 80,
+        ),
+        indexBatchSize: Math.max(
+          1,
+          parseFiniteInt(env.LCM_VECTOR_SEARCH_INDEX_BATCH_SIZE)
+            ?? toNumber(vectorSearch?.indexBatchSize)
+            ?? 32,
+        ),
+        timeoutMs: Math.max(
+          1,
+          parseFiniteInt(env.LCM_VECTOR_SEARCH_TIMEOUT_MS)
+            ?? toNumber(vectorSearch?.timeoutMs)
+            ?? 30000,
+        ),
+        apiKey:
+          env.LCM_EMBEDDING_API_KEY?.trim()
+            ?? env.LCM_VECTOR_SEARCH_API_KEY?.trim()
+            ?? toStr(vectorSearch?.apiKey)
+            ?? undefined,
       },
       nightlyCompactHour: resolvedNightlyCompactionHour,
     },

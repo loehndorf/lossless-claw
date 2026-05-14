@@ -26,13 +26,13 @@ function formatDisplayTime(
 const LcmGrepSchema = Type.Object({
   pattern: Type.String({
     description:
-      'Search pattern. Interpreted as regex when mode is "regex", or as an FTS5 text query when mode is "full_text". In full_text mode, FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase instead of padding with synonyms or extra keywords.',
+      'Search pattern. Interpreted as regex when mode is "regex", as an FTS5 text query when mode is "full_text", or as a semantic query when mode is "semantic". In full_text mode, FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase instead of padding with synonyms or extra keywords.',
   }),
   mode: Type.Optional(
     Type.String({
       description:
-        'Search mode: "regex" for regular expression matching, "full_text" for text search. Default: "regex".',
-      enum: ["regex", "full_text"],
+        'Search mode: "regex" for regular expression matching, "full_text" for text search, or "semantic" for optional vector search when enabled. Default: "regex".',
+      enum: ["regex", "full_text", "semantic"],
     }),
   ),
   scope: Type.Optional(
@@ -101,7 +101,7 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
+      "Search compacted conversation history using regex, full-text, or optional semantic vector search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. In full_text mode, queries use FTS5 AND semantics by default, so keep them short and focused; quoted phrases stay intact and optional sort modes can prioritize relevance for older topics. Returns matching snippets with their summary/message IDs " +
@@ -117,7 +117,7 @@ export function createLcmGrepTool(input: {
 
       const p = params as Record<string, unknown>;
       const pattern = (p.pattern as string).trim();
-      const mode = (p.mode as "regex" | "full_text") ?? "regex";
+      const mode = (p.mode as "regex" | "full_text" | "semantic") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
       const requestedSort = (p.sort as "recency" | "relevance" | "hybrid") ?? "recency";

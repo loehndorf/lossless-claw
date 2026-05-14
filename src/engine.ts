@@ -51,6 +51,12 @@ import {
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
+import {
+  DeterministicEmbeddingProvider,
+  EmbeddingStore,
+  HttpEmbeddingProvider,
+  drainSummaryEmbeddingQueue,
+} from "./embeddings.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -1660,6 +1666,9 @@ export class LcmContextEngine implements ContextEngine {
   private compactionMaintenanceStore: CompactionMaintenanceStore;
   private rootSummaryStore: RootSummaryStore;
   private sessionRootSummaryStore: SessionRootSummaryStore;
+  private embeddingStore: EmbeddingStore;
+  private embeddingProvider?: DeterministicEmbeddingProvider | HttpEmbeddingProvider;
+  private embeddingModelId?: string;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -1847,6 +1856,24 @@ export class LcmContextEngine implements ContextEngine {
         message: `[lcm] Stateless session patterns${enforcement} from ${source}: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
+
+    this.embeddingStore = new EmbeddingStore(this.db);
+    const vectorSearchConfig = this.config.vectorSearch;
+    if (vectorSearchConfig.enabled) {
+      this.embeddingProvider = vectorSearchConfig.provider.trim().toLowerCase() === "deterministic"
+        ? new DeterministicEmbeddingProvider(vectorSearchConfig.dimensions ?? 16)
+        : new HttpEmbeddingProvider(vectorSearchConfig);
+      const knownDimensions = vectorSearchConfig.dimensions ?? this.embeddingProvider.dimensions;
+      if (knownDimensions) {
+        const model = this.embeddingStore.ensureModel(vectorSearchConfig, knownDimensions);
+        this.embeddingModelId = model.embeddingModelId;
+      } else {
+        this.deps.log.warn(
+          `[lcm] vector search enabled for provider=${vectorSearchConfig.provider} model=${vectorSearchConfig.model}, but embedding dimensions are unknown; summary embedding queue will wait until vectorSearch.dimensions is configured.`,
+        );
+      }
+    }
+
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
@@ -1876,7 +1903,17 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log,
     );
 
-    this.retrieval = new RetrievalEngine(this.conversationStore, this.summaryStore);
+    this.retrieval = new RetrievalEngine(
+      this.conversationStore,
+      this.summaryStore,
+      vectorSearchConfig.enabled && this.embeddingProvider
+        ? {
+            config: vectorSearchConfig,
+            store: this.embeddingStore,
+            provider: this.embeddingProvider,
+          }
+        : undefined,
+    );
   }
 
   /**
@@ -3626,6 +3663,7 @@ export class LcmContextEngine implements ContextEngine {
     });
     this.markRootSummariesStaleAfterCompaction(result, conversationId);
     await this.materializeRootIndexKeywordsAfterCompaction(result, summarize);
+    this.queueSummaryEmbeddings(conversationId, "compaction");
     return result;
   }
 
@@ -3643,6 +3681,41 @@ export class LcmContextEngine implements ContextEngine {
       });
     } catch (error) {
       this.deps.log.warn(`[lcm] materializing root-index keywords after compaction failed: ${describeLogError(error)}`);
+    }
+  }
+
+  private queueSummaryEmbeddings(conversationId?: number, reason = "maintenance"): number {
+    if (!this.config.vectorSearch.enabled || !this.embeddingModelId) return 0;
+    if (this.config.vectorSearch.scope === "messages") return 0;
+    try {
+      return this.embeddingStore.enqueueMissingSummaryEmbeddings({
+        embeddingModelId: this.embeddingModelId,
+        conversationId,
+        reason,
+      });
+    } catch (error) {
+      this.deps.log.warn(`[lcm] queueing summary embeddings failed: ${describeLogError(error)}`);
+      return 0;
+    }
+  }
+
+  private async drainSummaryEmbeddings(): Promise<void> {
+    if (!this.config.vectorSearch.enabled || !this.embeddingModelId || !this.embeddingProvider) return;
+    if (this.config.vectorSearch.scope === "messages") return;
+    try {
+      const result = await drainSummaryEmbeddingQueue({
+        store: this.embeddingStore,
+        provider: this.embeddingProvider,
+        config: this.config.vectorSearch,
+        embeddingModelId: this.embeddingModelId,
+      });
+      if (result.processed > 0) {
+        this.deps.log.debug(
+          `[lcm] vector search: drained summary embedding queue processed=${result.processed} embedded=${result.embedded} failed=${result.failed}`,
+        );
+      }
+    } catch (error) {
+      this.deps.log.warn(`[lcm] draining summary embedding queue failed: ${describeLogError(error)}`);
     }
   }
 
@@ -5853,6 +5926,9 @@ export class LcmContextEngine implements ContextEngine {
           );
         }
 
+        this.queueSummaryEmbeddings(conversation.conversationId, "maintenance");
+        await this.drainSummaryEmbeddings();
+
         if (!this.config.transcriptGcEnabled) {
           return (
             deferredCompactionResult ?? {
@@ -6636,6 +6712,7 @@ export class LcmContextEngine implements ContextEngine {
       legacyParams,
       sessionLabel,
     });
+    this.queueSummaryEmbeddings(conversation.conversationId, "after-turn");
 
     this.deps.log.info(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,

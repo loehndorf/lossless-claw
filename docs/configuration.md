@@ -81,6 +81,20 @@ Most installations only need to override a handful of keys. If you want a comple
     "enabled": true,
     "hour": 4,
     "forceFreshTail": true
+  },
+  "vectorSearch": {
+    "enabled": false,
+    "provider": "ollama",
+    "model": "bge-m3",
+    "baseUrl": "",
+    "dimensions": 1024,
+    "scope": "summaries",
+    "store": "sqlite",
+    "hybridWeight": 0.35,
+    "maxCandidates": 80,
+    "indexBatchSize": 32,
+    "timeoutMs": 30000,
+    "apiKey": ""
   }
 }
 ```
@@ -94,6 +108,7 @@ Notes on the example:
 - `maxAssemblyTokenBudget` has no default. The example uses `30000` as a realistic cap for a 32k-class model.
 - `databasePath` is the preferred key. `dbPath` is an accepted alias.
 - `largeFileThresholdTokens` is the preferred key. `largeFileTokenThreshold` is an accepted alias.
+- `vectorSearch.dimensions`, `vectorSearch.baseUrl`, and `vectorSearch.apiKey` are optional. The example dimension matches Ollama `bge-m3`; change or remove it for a different embedding model.
 
 ## Install and enable
 
@@ -261,6 +276,27 @@ This legacy config key controls the visibility-scoped root index injected at ses
 | `nightlyCompaction.enabled` | `boolean` | `true` | `LCM_NIGHTLY_COMPACTION_ENABLED` | Enables the built-in nightly maintenance sweep. |
 | `nightlyCompaction.hour` | `integer` | `4` | `LCM_NIGHTLY_COMPACTION_HOUR` or `LCM_NIGHTLY_COMPACT_HOUR` | Local hour for the sweep. |
 | `nightlyCompaction.forceFreshTail` | `boolean` | `true` | `LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL` | Allows forced nightly compaction to summarize the protected fresh tail. |
+
+#### `vectorSearch`
+
+Vector search is optional and disabled by default. The MVP stores summary embeddings in SQLite (`embedding_models`, `embeddings`, `embedding_queue`) and scores cosine similarity in-process. It is summary-first; `scope: "both"` currently behaves like summaries for semantic search, and message embeddings are reserved for a later slice.
+
+Remote embedding providers receive summary text. Use local Ollama if conversation privacy is more important than provider-hosted semantic search.
+
+| Key | Type | Default | Env override | Purpose |
+| --- | --- | --- | --- | --- |
+| `vectorSearch.enabled` | `boolean` | `false` | `LCM_VECTOR_SEARCH_ENABLED` | Enables semantic retrieval. |
+| `vectorSearch.provider` | `string` | `"ollama"` | `LCM_EMBEDDING_PROVIDER` or `LCM_VECTOR_SEARCH_PROVIDER` | Embedding provider id. `ollama` uses `/api/embed`; other providers use OpenAI-compatible `/embeddings`. |
+| `vectorSearch.model` | `string` | `"bge-m3"` | `LCM_EMBEDDING_MODEL` or `LCM_VECTOR_SEARCH_MODEL` | Embedding model id. For Ollama, pull it first with `ollama pull bge-m3`. |
+| `vectorSearch.baseUrl` | `string` | provider default | `LCM_EMBEDDING_BASE_URL` or `LCM_VECTOR_SEARCH_BASE_URL` | Provider base URL. Ollama defaults to `http://localhost:11434`. |
+| `vectorSearch.dimensions` | `integer` | unset | `LCM_EMBEDDING_DIMENSIONS` or `LCM_VECTOR_SEARCH_DIMENSIONS` | Expected vector dimensions. Configure this for HTTP providers whose dimensions are not known before the first request, otherwise queued summary embedding waits. |
+| `vectorSearch.scope` | `"summaries" \| "messages" \| "both"` | `"summaries"` | `LCM_VECTOR_SEARCH_SCOPE` | Semantic artifact scope. Current implementation embeds and searches summaries only. |
+| `vectorSearch.store` | `"sqlite"` | `"sqlite"` | none | Vector store backend. Current implementation uses SQLite JSON vectors. |
+| `vectorSearch.hybridWeight` | `number` | `0.35` | `LCM_VECTOR_SEARCH_HYBRID_WEIGHT` | Reserved for future hybrid lexical+semantic ranking. |
+| `vectorSearch.maxCandidates` | `integer` | `80` | `LCM_VECTOR_SEARCH_MAX_CANDIDATES` | Maximum semantic candidates returned/scored for one search. |
+| `vectorSearch.indexBatchSize` | `integer` | `32` | `LCM_VECTOR_SEARCH_INDEX_BATCH_SIZE` | Pending embedding jobs processed per maintenance batch. |
+| `vectorSearch.timeoutMs` | `integer` | `30000` | `LCM_VECTOR_SEARCH_TIMEOUT_MS` | Embedding provider request timeout. |
+| `vectorSearch.apiKey` | `string` | unset | `LCM_EMBEDDING_API_KEY` or `LCM_VECTOR_SEARCH_API_KEY` | Bearer API key for remote OpenAI-compatible providers. Prefer environment variables or secret references over plain config. |
 
 ### Cache-aware incremental compaction
 

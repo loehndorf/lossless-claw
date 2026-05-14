@@ -467,6 +467,17 @@ Default Discord setup:
     "enabled": true,
     "hour": 4,
     "forceFreshTail": true
+  },
+  "vectorSearch": {
+    "enabled": false,
+    "provider": "ollama",
+    "model": "bge-m3",
+    "scope": "summaries",
+    "store": "sqlite",
+    "hybridWeight": 0.35,
+    "maxCandidates": 80,
+    "indexBatchSize": 32,
+    "timeoutMs": 30000
   }
 }
 ```
@@ -523,6 +534,38 @@ Defaults:
 Why it matters:
 
 - nightly maintenance can compact quiet conversations, create session abstracts, refresh root-index keywords, and regenerate stale root indices
+
+### `vectorSearch`
+
+Optional semantic retrieval over LCM summaries. Disabled by default.
+
+Defaults:
+
+- `enabled: false`
+- `provider: "ollama"`
+- `model: "bge-m3"`
+- `scope: "summaries"`
+- `store: "sqlite"`
+- `hybridWeight: 0.35`
+- `maxCandidates: 80`
+- `indexBatchSize: 32`
+- `timeoutMs: 30000`
+
+Why it matters:
+
+- stores summary embeddings in SQLite tables and scores cosine similarity in-process
+- enables `lcm_grep` with `mode: "semantic"` when configured
+- currently embeds and searches summaries; message embeddings are reserved for a later slice
+- remote embedding providers receive summary text, so local Ollama is preferable for private deployments
+
+Useful env overrides:
+
+- `LCM_VECTOR_SEARCH_ENABLED`
+- `LCM_EMBEDDING_PROVIDER` or `LCM_VECTOR_SEARCH_PROVIDER`
+- `LCM_EMBEDDING_MODEL` or `LCM_VECTOR_SEARCH_MODEL`
+- `LCM_EMBEDDING_BASE_URL` or `LCM_VECTOR_SEARCH_BASE_URL`
+- `LCM_EMBEDDING_DIMENSIONS` or `LCM_VECTOR_SEARCH_DIMENSIONS`
+- `LCM_EMBEDDING_API_KEY` or `LCM_VECTOR_SEARCH_API_KEY`
 
 ## Summary quality and prompt controls
 

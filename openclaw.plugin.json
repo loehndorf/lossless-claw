@@ -252,6 +252,30 @@
         "nightlyCompaction.forceFreshTail": {
             "label": "Force Fresh Tail During Nightly Compaction",
             "help": "Allow forced nightly compaction to summarize the protected fresh tail so quiet conversations still get a compact abstract"
+        },
+        "vectorSearch.enabled": {
+            "label": "Vector Search",
+            "help": "Enable optional semantic/vector retrieval. Disabled by default."
+        },
+        "vectorSearch.provider": {
+            "label": "Embedding Provider",
+            "help": "Embedding provider id, e.g. ollama, openrouter, openai, or a configured OpenAI-compatible provider"
+        },
+        "vectorSearch.model": {
+            "label": "Embedding Model",
+            "help": "Embedding model id, e.g. bge-m3 for local Ollama"
+        },
+        "vectorSearch.baseUrl": {
+            "label": "Embedding Base URL",
+            "help": "Optional base URL for local/proxy/OpenAI-compatible embedding endpoints"
+        },
+        "vectorSearch.apiKey": {
+            "label": "Embedding API Key",
+            "help": "Optional bearer token/API key for remote embedding providers. Prefer environment variables or secret references where supported."
+        },
+        "vectorSearch.scope": {
+            "label": "Vector Search Scope",
+            "help": "Which LCM artifacts to embed/search semantically"
         }
     },
     "configSchema": {
@@ -592,6 +616,71 @@
                     "forceFreshTail": {
                         "type": "boolean",
                         "default": true
+                    }
+                }
+            },
+            "vectorSearch": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "default": false
+                    },
+                    "provider": {
+                        "type": "string",
+                        "default": "ollama"
+                    },
+                    "model": {
+                        "type": "string",
+                        "default": "bge-m3"
+                    },
+                    "baseUrl": {
+                        "type": "string"
+                    },
+                    "apiKey": {
+                        "type": "string"
+                    },
+                    "dimensions": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "scope": {
+                        "type": "string",
+                        "default": "summaries",
+                        "enum": [
+                            "summaries",
+                            "messages",
+                            "both"
+                        ]
+                    },
+                    "store": {
+                        "type": "string",
+                        "default": "sqlite",
+                        "enum": [
+                            "sqlite"
+                        ]
+                    },
+                    "hybridWeight": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "default": 0.35
+                    },
+                    "maxCandidates": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 80
+                    },
+                    "indexBatchSize": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 32
+                    },
+                    "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 30000
                     }
                 }
             }
