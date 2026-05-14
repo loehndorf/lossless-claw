@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
 import { SessionManager, type SessionEntry } from "@mariozechner/pi-coding-agent";
@@ -73,6 +74,7 @@ import {
   type CreateMessagePartInput,
   type MessagePartRecord,
   type MessagePartType,
+  type MessageRecord,
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError, type LcmSummarizeFn } from "./summarize.js";
@@ -176,6 +178,78 @@ type ContextEngineMaintenanceRuntimeContext = Record<string, unknown> & {
   ) => Promise<ContextEngineMaintenanceResult>;
 };
 
+type SourceDeletionEvent = {
+  provider?: string;
+  channelId?: string;
+  threadId?: string;
+  messageIds?: string[];
+  sessionId?: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  deleteTranscript?: boolean;
+  rewriteActiveSession?: boolean;
+  rebuildSummaries?: boolean;
+};
+
+type ConversationTurnRewindEvent = {
+  provider?: string;
+  channelId?: string;
+  threadId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  turns: number;
+  deleteTranscript?: boolean;
+  rewriteActiveSession?: boolean;
+  backupTranscript?: boolean;
+  dryRun?: boolean;
+  deleteDiscord?: boolean;
+  reason?: string;
+};
+
+type DiscordDeleteResult = {
+  attempted: number;
+  deleted: number;
+  failed: number;
+  failures: Array<{ messageId?: string; status?: number; error?: string }>;
+  reason?: string;
+};
+
+type SourceRewindEvent = {
+  provider?: string;
+  channelId?: string;
+  threadId?: string;
+  messageId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  deleteTranscript?: boolean;
+  rewriteActiveSession?: boolean;
+  dryRun?: boolean;
+  allowAmbiguous?: boolean;
+  allowContentFallback?: boolean;
+  recordTombstone?: boolean;
+  reason?: string;
+};
+
+type SourceScopeDeletionEvent = {
+  provider?: string;
+  channelId?: string;
+  threadId?: string;
+  scopeType: "channel" | "thread";
+  sessionId?: string;
+  sessionKey?: string;
+  sessionFile?: string;
+  purgeAfter?: Date | null;
+  reason?: string;
+};
+
+type SourceIdentity = {
+  provider?: string | null;
+  channelId?: string | null;
+  threadId?: string | null;
+  messageId?: string | null;
+};
 type DeferredCompactionDebtDrainParams = {
   conversationId: number;
   sessionId: string;
@@ -1096,6 +1170,32 @@ type StoredMessage = {
 /**
  * Normalize AgentMessage variants into the storage shape used by LCM.
  */
+function extractSourceIdentityFromText(text: string): SourceIdentity {
+  const relevantMemoriesEnd = text.lastIndexOf("</relevant-memories>");
+  const searchableContent = relevantMemoriesEnd >= 0
+    ? text.slice(relevantMemoriesEnd + "</relevant-memories>".length)
+    : text;
+  const lastMatch = (pattern: RegExp): string | null => {
+    let value: string | null = null;
+    for (const match of searchableContent.matchAll(pattern)) {
+      value = match[1] ?? value;
+    }
+    return value;
+  };
+  const channelId = lastMatch(/(?:(?:"|&quot;)chat_id(?:"|&quot;)\s*:\s*(?:"|&quot;)channel:(\d+)(?:"|&quot;)|(?:"|&quot;)group_channel_id(?:"|&quot;)\s*:\s*(?:"|&quot;)?(\d+)(?:"|&quot;)?)/g);
+  return {
+    provider: lastMatch(/(?:"|&quot;)(?:provider|surface|channel)(?:"|&quot;)\s*:\s*(?:"|&quot;)([a-zA-Z0-9_-]+)(?:"|&quot;)/g),
+    channelId: channelId,
+    threadId: lastMatch(/(?:"|&quot;)topic_id(?:"|&quot;)\s*:\s*(?:"|&quot;)?(\d+)(?:"|&quot;)?/g),
+    messageId: lastMatch(/(?:"|&quot;)message_id(?:"|&quot;)\s*:\s*(?:"|&quot;)?(\d+)(?:"|&quot;)?/g),
+  };
+}
+
+function extractSourceIdentityFromMessage(message: AgentMessage): SourceIdentity {
+  const content = "content" in message ? extractMessageContent(message.content) : "";
+  return extractSourceIdentityFromText(content);
+}
+
 function toStoredMessage(message: AgentMessage): StoredMessage {
   const content =
     "content" in message
@@ -2234,6 +2334,41 @@ export class LcmContextEngine implements ContextEngine {
     return canonical ?? sessionKey;
   }
 
+  private collectDiscordMessageIdsForVisibleDelete(messages: MessageRecord[]): string[] {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const message of messages) {
+      const id = message.sourceMessageId?.trim();
+      if (!id || !/^\d{8,30}$/.test(id) || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  private resolveDiscordDeleteChannelId(event: ConversationTurnRewindEvent): string | undefined {
+    return event.threadId?.trim() || event.channelId?.trim();
+  }
+
+  private async deleteDiscordMessagesForRewind(params: { channelId?: string; messageIds: string[]; targetUserMessageIds?: string[]; deleteBotReplies?: boolean }): Promise<DiscordDeleteResult> {
+    const channelId = params.channelId?.replace(/^channel:/, "").trim();
+    const messageIds = Array.from(new Set(params.messageIds.map((id) => id.trim()).filter((id) => /^\d{8,30}$/.test(id))));
+    if (messageIds.length === 0) return { attempted: 0, deleted: 0, failed: 0, failures: [], reason: "no-message-ids" };
+    if (!channelId || !/^\d{8,30}$/.test(channelId)) return { attempted: messageIds.length, deleted: 0, failed: messageIds.length, failures: messageIds.map((messageId) => ({ messageId, error: "missing-channel-id" })), reason: "missing-channel-id" };
+    const scriptPath = join(dirname(new URL(import.meta.url).pathname), "../scripts/delete-discord-messages.mjs");
+    const payload = JSON.stringify({ channelId, messageIds, targetUserMessageIds: params.targetUserMessageIds ?? messageIds, deleteBotReplies: params.deleteBotReplies === true });
+    return await new Promise<DiscordDeleteResult>((resolve) => {
+      const child = spawn(process.execPath, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
+      let stdout = ""; let stderr = "";
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve({ attempted: messageIds.length, deleted: 0, failed: messageIds.length, failures: messageIds.map((messageId) => ({ messageId, error: "discord-delete-timeout" })), reason: "timeout" }); }, 30_000);
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", (error) => { clearTimeout(timer); resolve({ attempted: messageIds.length, deleted: 0, failed: messageIds.length, failures: messageIds.map((messageId) => ({ messageId, error: error.message })), reason: "spawn-error" }); });
+      child.on("close", () => { clearTimeout(timer); try { const parsed = JSON.parse(stdout.trim() || "{}"); resolve({ attempted: messageIds.length, deleted: Number(parsed.deleted ?? 0), failed: Number(parsed.failed ?? 0), failures: Array.isArray(parsed.failures) ? parsed.failures : [], reason: typeof parsed.reason === "string" ? parsed.reason : undefined }); } catch { resolve({ attempted: messageIds.length, deleted: 0, failed: messageIds.length, failures: messageIds.map((messageId) => ({ messageId, error: (stderr || stdout || "invalid-delete-script-output").slice(0, 300) })), reason: "invalid-output" }); } });
+      child.stdin.end(payload);
+    });
+  }
+
   private enhanceSessionKeyFromSessionFile(sessionKey: string | undefined, sessionFile: string | undefined): string | undefined {
     if (!sessionKey) return sessionKey;
     const channelMatch = sessionKey.match(/^agent:main:discord:channel:(\d+)$/);
@@ -2243,8 +2378,9 @@ export class LcmContextEngine implements ContextEngine {
     if (!topicMatch) return sessionKey;
     const topicId = topicMatch[1];
     // When OpenClaw reports the Discord thread id as the channel id and no
-    // current message metadata is available, recover the canonical
-    // parent-channel key from existing LCM conversations. Otherwise we create a duplicate
+    // current message metadata is available (manual compaction, maintenance,
+    // source-deletion callbacks), recover the canonical parent-channel key from
+    // existing LCM conversations. Otherwise we create a duplicate
     // channel:<thread>:topic:<thread> conversation next to the real
     // channel:<parent>:topic:<thread> conversation.
     if (channelMatch[1] === topicId) {
@@ -2256,6 +2392,765 @@ export class LcmContextEngine implements ContextEngine {
 
   private enhanceSessionKeyForCompaction(params: { sessionKey?: string; sessionFile?: string }): string | undefined {
     return this.enhanceSessionKeyFromSessionFile(params.sessionKey, params.sessionFile);
+  }
+
+  private isMessageDeleted(source: SourceIdentity): boolean {
+    if (!source.messageId?.trim()) return false;
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found FROM source_deletions
+         WHERE message_id = ?
+           AND (? IS NULL OR provider IS NULL OR provider = ?)
+           AND (? IS NULL OR channel_id IS NULL OR channel_id = ?)
+           AND (? IS NULL OR thread_id IS NULL OR thread_id = ?)
+         LIMIT 1`,
+      )
+      .get(
+        source.messageId.trim(),
+        source.provider ?? null,
+        source.provider ?? null,
+        source.channelId ?? null,
+        source.channelId ?? null,
+        source.threadId ?? null,
+        source.threadId ?? null,
+      ) as unknown as { found: number } | undefined;
+    return Boolean(row);
+  }
+
+  private filterDeletedLiveMessages(messages: AgentMessage[]): AgentMessage[] {
+    const filtered = messages.filter((message) => {
+      if (!message || message.role !== "user") return true;
+      return !this.isMessageDeleted(extractSourceIdentityFromMessage(message));
+    });
+    return filtered.length === messages.length ? messages : filtered;
+  }
+
+
+  private normalizeSourceDeletionEvent(input: unknown): SourceDeletionEvent {
+    const record = asRecord(input) ?? {};
+    const stringField = (...keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const value = safeString(record[key]);
+        if (value?.trim()) return value.trim();
+      }
+      return undefined;
+    };
+    const rawMessageIds = record.messageIds ?? record.message_ids;
+    const messageIds = Array.isArray(rawMessageIds)
+      ? rawMessageIds.map((value) => safeString(value)?.trim()).filter((value): value is string => Boolean(value))
+      : stringField("messageId", "message_id")
+        ? [stringField("messageId", "message_id")!]
+        : [];
+    return {
+      provider: stringField("provider", "channel", "surface"),
+      channelId: stringField("channelId", "channel_id", "chatId", "chat_id")?.replace(/^channel:/, ""),
+      threadId: stringField("threadId", "thread_id", "topicId", "topic_id"),
+      messageIds,
+      sessionId: stringField("sessionId", "session_id"),
+      sessionKey: stringField("sessionKey", "session_key"),
+      sessionFile: stringField("sessionFile", "session_file"),
+      deleteTranscript: record.deleteTranscript !== false,
+      rebuildSummaries: record.rebuildSummaries === true,
+    };
+  }
+
+  private recordSourceDeletion(event: SourceDeletionEvent): void {
+    const stmt = this.db.prepare(
+      `INSERT OR IGNORE INTO source_deletions (provider, channel_id, thread_id, message_id)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const messageId of event.messageIds ?? []) {
+      stmt.run(event.provider ?? null, event.channelId ?? null, event.threadId ?? null, messageId);
+    }
+  }
+
+  private normalizeSourceRewindEvent(input: unknown): SourceRewindEvent {
+    const record = asRecord(input) ?? {};
+    const stringField = (...keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const value = safeString(record[key]);
+        if (value?.trim()) return value.trim();
+      }
+      return undefined;
+    };
+    return {
+      provider: stringField("provider", "channel", "surface"),
+      channelId: stringField("channelId", "channel_id", "chatId", "chat_id")?.replace(/^channel:/, ""),
+      threadId: stringField("threadId", "thread_id", "topicId", "topic_id"),
+      messageId: stringField("messageId", "message_id"),
+      sessionId: stringField("sessionId", "session_id"),
+      sessionKey: stringField("sessionKey", "session_key"),
+      sessionFile: stringField("sessionFile", "session_file"),
+      deleteTranscript: record.deleteTranscript !== false,
+      rewriteActiveSession: record.rewriteActiveSession !== false,
+      dryRun: record.dryRun === true || record.dry_run === true,
+      allowAmbiguous: record.allowAmbiguous === true || record.allow_ambiguous === true,
+      allowContentFallback: record.allowContentFallback === true || record.allow_content_fallback === true,
+      recordTombstone: record.recordTombstone === true || record.record_tombstone === true,
+      reason: stringField("reason") ?? "source-rewind",
+    };
+  }
+
+
+  private normalizeConversationTurnRewindEvent(input: unknown): ConversationTurnRewindEvent {
+    const record = asRecord(input) ?? {};
+    const stringField = (...keys: string[]): string | undefined => {
+      for (const key of keys) { const value = safeString(record[key]); if (value?.trim()) return value.trim(); }
+      return undefined;
+    };
+    const rawTurns = record.turns ?? record.count ?? record.n;
+    const numericTurns = typeof rawTurns === "number" ? rawTurns : typeof rawTurns === "string" && rawTurns.trim() ? Number(rawTurns.trim()) : 1;
+    return {
+      provider: stringField("provider", "channel", "surface"),
+      channelId: stringField("channelId", "channel_id", "chatId", "chat_id")?.replace(/^channel:/, ""),
+      threadId: stringField("threadId", "thread_id", "topicId", "topic_id"),
+      sessionId: stringField("sessionId", "session_id"),
+      sessionKey: stringField("sessionKey", "session_key"),
+      sessionFile: stringField("sessionFile", "session_file"),
+      turns: Math.max(1, Math.min(50, Number.isFinite(numericTurns) ? Math.floor(numericTurns) : 1)),
+      deleteTranscript: record.deleteTranscript !== false,
+      rewriteActiveSession: record.rewriteActiveSession !== false,
+      backupTranscript: record.backupTranscript === true || record.backup_transcript === true,
+      dryRun: record.dryRun === true || record.dry_run === true,
+      deleteDiscord: record.deleteDiscord === true || record.delete_discord === true,
+      reason: stringField("reason") ?? "turn-rewind",
+    };
+  }
+
+  private resolveLikelySessionFilesForTurnRewind(params: {
+    sessionFile?: string;
+    sessionId?: string;
+    threadId?: string;
+    conversationId: number;
+  }): string[] {
+    const candidates = new Set<string>();
+    const add = (value: unknown) => {
+      if (typeof value === "string" && value.trim()) candidates.add(value.trim());
+    };
+    add(params.sessionFile);
+    const addRows = (rows: unknown[]) => {
+      for (const row of rows as Array<{ session_file_path?: unknown }>) add(row.session_file_path);
+    };
+    try {
+      addRows(this.db.prepare(`SELECT session_file_path FROM conversation_bootstrap_state WHERE conversation_id = ?`).all(params.conversationId));
+    } catch {}
+    if (params.sessionId?.trim()) {
+      try {
+        addRows(this.db.prepare(`SELECT session_file_path FROM conversation_bootstrap_state WHERE conversation_id IN (SELECT conversation_id FROM conversations WHERE session_id = ? AND active = 1)`).all(params.sessionId.trim()));
+      } catch {}
+      const openclawHome = join(dirname(this.config.databasePath), "..");
+      const base = join(openclawHome, "agents", "main", "sessions", params.sessionId.trim());
+      add(`${base}.jsonl`);
+      if (params.threadId?.trim()) add(`${base}-topic-${params.threadId.trim()}.jsonl`);
+    }
+    return Array.from(candidates);
+  }
+
+  private normalizeSourceScopeDeletionEvent(input: unknown): SourceScopeDeletionEvent {
+    const record = asRecord(input) ?? {};
+    const stringField = (...keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const value = safeString(record[key]);
+        if (value?.trim()) return value.trim();
+      }
+      return undefined;
+    };
+    const rawScopeType = stringField("scopeType", "scope_type", "type", "kind");
+    const scopeType = rawScopeType === "channel" ? "channel" : "thread";
+    return {
+      provider: stringField("provider", "channel", "surface"),
+      channelId: stringField("channelId", "channel_id", "chatId", "chat_id")?.replace(/^channel:/, ""),
+      threadId: stringField("threadId", "thread_id", "topicId", "topic_id"),
+      scopeType,
+      sessionId: stringField("sessionId", "session_id"),
+      sessionKey: stringField("sessionKey", "session_key"),
+      sessionFile: stringField("sessionFile", "session_file"),
+      purgeAfter: null,
+      reason: stringField("reason") ?? `${scopeType}-delete`,
+    };
+  }
+
+  async onSourceScopeDeleted(params: unknown): Promise<{
+    ok: boolean;
+    archivedConversations: number;
+    affectedConversations: number[];
+    reason?: string;
+  }> {
+    this.ensureMigrated();
+    const event = this.normalizeSourceScopeDeletionEvent(params);
+    if (event.scopeType === "channel" && !event.channelId) {
+      return { ok: false, archivedConversations: 0, affectedConversations: [], reason: "missing-channel-id" };
+    }
+    if (event.scopeType === "thread" && !event.threadId) {
+      return { ok: false, archivedConversations: 0, affectedConversations: [], reason: "missing-thread-id" };
+    }
+    const effectiveSessionKey = this.enhanceSessionKeyFromSessionFile(event.sessionKey, event.sessionFile);
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(event.sessionId, effectiveSessionKey),
+      async () => {
+        await this.conversationStore.recordSourceScopeDeletion(event);
+        const affectedConversationIds = await this.conversationStore.listConversationIdsInSourceScope(event);
+        const archivedConversations = await this.conversationStore.archiveConversations(affectedConversationIds);
+        for (const conversationId of affectedConversationIds) {
+          this.invalidateConversationRuntimeCaches(conversationId);
+        }
+        this.deps.log.info(
+          `[lcm] source scope deletion tombstoned provider=${event.provider ?? "unknown"} channel=${event.channelId ?? "unknown"} thread=${event.threadId ?? "none"} type=${event.scopeType} archivedConversations=${archivedConversations}`,
+        );
+        return { ok: true, archivedConversations, affectedConversations: affectedConversationIds };
+      },
+      {
+        operationName: "source-scope-delete",
+        context: [
+          ...(event.sessionId ? [`session=${event.sessionId}`] : []),
+          ...(effectiveSessionKey ? [`sessionKey=${effectiveSessionKey}`] : []),
+          `scope=${event.scopeType}`,
+        ].join(" "),
+      },
+    );
+  }
+
+  private lineReferencesJsonField(line: string, key: string, value: string): boolean {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      return (parsed as Record<string, unknown>)[key] === value;
+    } catch {
+      return false;
+    }
+  }
+
+  private lineReferencesSourceMessageId(line: string, deleted: Set<string>): boolean {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      const stack: unknown[] = [parsed];
+      while (stack.length > 0) {
+        const value = stack.pop();
+        if (!value || typeof value !== "object") continue;
+        if (Array.isArray(value)) {
+          stack.push(...value);
+          continue;
+        }
+        const record = value as Record<string, unknown>;
+        const candidate = record.message_id ?? record.messageId;
+        if (typeof candidate === "string" && deleted.has(candidate.trim())) return true;
+        if (typeof candidate === "number" && deleted.has(String(candidate))) return true;
+        stack.push(...Object.values(record));
+      }
+    } catch {}
+    return Array.from(deleted).some((messageId) => line.includes(messageId));
+  }
+
+  private async hardRewriteSessionManagerForSourceDeletion(params: {
+    sessionFile: string;
+    messageIds: string[];
+  }): Promise<{ removedEntries: number; bytesFreed: number; changed: boolean; reason?: string }> {
+    const deleted = new Set(params.messageIds.map((id) => id.trim()).filter(Boolean));
+    if (deleted.size === 0) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "no-message-ids" };
+    let sessionManager: SessionManager;
+    try {
+      sessionManager = SessionManager.open(params.sessionFile);
+    } catch (error) {
+      return { removedEntries: 0, bytesFreed: 0, changed: false, reason: describeLogError(error) };
+    }
+    const branch = sessionManager.getBranch();
+    const firstRemovedIndex = branch.findIndex((entry) => {
+      if (entry.type !== "message") return false;
+      return this.lineReferencesSourceMessageId(JSON.stringify(entry.message), deleted);
+    });
+    if (firstRemovedIndex < 0) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "no matching active-branch entries" };
+    const firstRemovedEntry = branch[firstRemovedIndex];
+    if (!firstRemovedEntry) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "invalid first removed entry" };
+
+    let removedEntries = 0;
+    let bytesFreed = 0;
+    if (!firstRemovedEntry.parentId) sessionManager.resetLeaf();
+    else sessionManager.branch(firstRemovedEntry.parentId);
+    for (let index = firstRemovedIndex; index < branch.length; index++) {
+      const entry = branch[index];
+      if (!entry) continue;
+      if (entry.type === "message" && this.lineReferencesSourceMessageId(JSON.stringify(entry.message), deleted)) {
+        removedEntries += 1;
+        bytesFreed += Buffer.byteLength(JSON.stringify(entry.message), "utf8");
+        continue;
+      }
+      if (entry.type === "message") {
+        sessionManager.appendMessage(entry.message as Parameters<SessionManager["appendMessage"]>[0]);
+      } else {
+        // Rewind is a privacy feature: keep the retained active branch simple and
+        // message-only after the cut point so stale labels/compactions/custom
+        // metadata cannot keep dangling references to deleted content.
+      }
+    }
+    return { removedEntries, bytesFreed, changed: removedEntries > 0 };
+  }
+
+  private async rewriteTranscriptForSourceDeletion(params: {
+    sessionFile?: string;
+    fallbackSessionFiles?: string[];
+    messageIds: string[];
+    rewriteActiveSession?: boolean;
+  }): Promise<{ removedEntries: number; bytesFreed: number; path?: string }> {
+    if (params.messageIds.length === 0) {
+      return { removedEntries: 0, bytesFreed: 0, path: params.sessionFile };
+    }
+    const candidates = Array.from(new Set([params.sessionFile, ...(params.fallbackSessionFiles ?? [])].filter((path): path is string => Boolean(path))));
+    if (candidates.length === 0) {
+      return { removedEntries: 0, bytesFreed: 0, path: params.sessionFile };
+    }
+    let totalRemovedEntries = 0;
+    let totalBytesFreed = 0;
+    let lastPath = params.sessionFile ?? candidates[0];
+    const deleted = new Set(params.messageIds);
+    for (const sessionFile of candidates) {
+      let raw: string;
+      try {
+        raw = await readFile(sessionFile, "utf8");
+      } catch {
+        continue;
+      }
+      const firstNonEmptyLine = raw.split(/\n/).find((line) => line.trim().length > 0);
+      const looksLikeSessionManagerTranscript = Boolean(firstNonEmptyLine && this.lineReferencesJsonField(firstNonEmptyLine, "type", "session"));
+      if (params.rewriteActiveSession !== false && looksLikeSessionManagerTranscript) {
+        const rewritten = await this.hardRewriteSessionManagerForSourceDeletion({ sessionFile, messageIds: params.messageIds });
+        if (rewritten.changed) {
+          totalRemovedEntries += rewritten.removedEntries;
+          totalBytesFreed += rewritten.bytesFreed;
+          lastPath = sessionFile;
+          continue;
+        }
+        raw = await readFile(sessionFile, "utf8").catch(() => raw);
+      }
+      const lines = raw.split(/\n/);
+      const kept: string[] = [];
+      let removedEntries = 0;
+      let bytesFreed = 0;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const remove = this.lineReferencesSourceMessageId(line, deleted);
+        if (remove) {
+          removedEntries += 1;
+          bytesFreed += Buffer.byteLength(line, "utf8") + 1;
+        } else {
+          kept.push(line);
+        }
+      }
+      if (removedEntries === 0) {
+        continue;
+      }
+      const tmpPath = `${sessionFile}.source-delete-${Date.now()}.tmp`;
+      await writeFile(tmpPath, kept.map((line) => `${line}
+`).join(""), "utf8");
+      await rename(tmpPath, sessionFile);
+      totalRemovedEntries += removedEntries;
+      totalBytesFreed += bytesFreed;
+      lastPath = sessionFile;
+    }
+    return { removedEntries: totalRemovedEntries, bytesFreed: totalBytesFreed, path: lastPath };
+  }
+
+  private async hardRewindSessionManagerAfterSourceMessage(params: {
+    sessionFile: string;
+    messageId: string;
+  }): Promise<{ removedEntries: number; bytesFreed: number; changed: boolean; reason?: string }> {
+    const messageId = params.messageId.trim();
+    if (!messageId) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "missing-message-id" };
+    let sessionManager: SessionManager;
+    try {
+      sessionManager = SessionManager.open(params.sessionFile);
+    } catch (error) {
+      return { removedEntries: 0, bytesFreed: 0, changed: false, reason: describeLogError(error) };
+    }
+    const branch = sessionManager.getBranch();
+    const cutIndex = branch.findIndex((entry) => {
+      if (entry.type !== "message") return false;
+      return this.lineReferencesSourceMessageId(JSON.stringify(entry.message), new Set([messageId]));
+    });
+    if (cutIndex < 0) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "no matching active-branch entries" };
+    const cutEntry = branch[cutIndex];
+    if (!cutEntry) return { removedEntries: 0, bytesFreed: 0, changed: false, reason: "invalid cut entry" };
+    if (!cutEntry.parentId) sessionManager.resetLeaf();
+    else sessionManager.branch(cutEntry.parentId);
+    let removedEntries = 0;
+    let bytesFreed = 0;
+    for (let index = cutIndex; index < branch.length; index++) {
+      const entry = branch[index];
+      if (!entry) continue;
+      removedEntries += 1;
+      bytesFreed += Buffer.byteLength(JSON.stringify(entry), "utf8");
+    }
+    return { removedEntries, bytesFreed, changed: removedEntries > 0 };
+  }
+
+  private async rewriteTranscriptForSourceRewind(params: {
+    sessionFile?: string;
+    fallbackSessionFiles?: string[];
+    messageId: string;
+    rewriteActiveSession?: boolean;
+  }): Promise<{ removedEntries: number; bytesFreed: number; path?: string }> {
+    const messageId = params.messageId.trim();
+    const candidates = Array.from(new Set([params.sessionFile, ...(params.fallbackSessionFiles ?? [])].filter((path): path is string => Boolean(path))));
+    if (!messageId || candidates.length === 0) return { removedEntries: 0, bytesFreed: 0, path: params.sessionFile };
+    let totalRemovedEntries = 0;
+    let totalBytesFreed = 0;
+    let lastPath = params.sessionFile ?? candidates[0];
+    for (const sessionFile of candidates) {
+      let raw: string;
+      try {
+        raw = await readFile(sessionFile, "utf8");
+      } catch {
+        continue;
+      }
+      const firstNonEmptyLine = raw.split(/\n/).find((line) => line.trim().length > 0);
+      const looksLikeSessionManagerTranscript = Boolean(firstNonEmptyLine && this.lineReferencesJsonField(firstNonEmptyLine, "type", "session"));
+      if (params.rewriteActiveSession !== false && looksLikeSessionManagerTranscript) {
+        const rewritten = await this.hardRewindSessionManagerAfterSourceMessage({ sessionFile, messageId });
+        if (rewritten.changed) {
+          totalRemovedEntries += rewritten.removedEntries;
+          totalBytesFreed += rewritten.bytesFreed;
+          lastPath = sessionFile;
+          continue;
+        }
+        raw = await readFile(sessionFile, "utf8").catch(() => raw);
+      }
+      const lines = raw.split(/\n/);
+      const kept: string[] = [];
+      let removeRest = false;
+      let removedEntries = 0;
+      let bytesFreed = 0;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        if (!removeRest && this.lineReferencesSourceMessageId(line, new Set([messageId]))) {
+          removeRest = true;
+        }
+        if (removeRest) {
+          removedEntries += 1;
+          bytesFreed += Buffer.byteLength(line, "utf8") + 1;
+        } else {
+          kept.push(line);
+        }
+      }
+      if (removedEntries === 0) continue;
+      const tmpPath = `${sessionFile}.source-rewind-${Date.now()}.tmp`;
+      await writeFile(tmpPath, kept.map((line) => `${line}
+`).join(""), "utf8");
+      await rename(tmpPath, sessionFile);
+      totalRemovedEntries += removedEntries;
+      totalBytesFreed += bytesFreed;
+      lastPath = sessionFile;
+    }
+    return { removedEntries: totalRemovedEntries, bytesFreed: totalBytesFreed, path: lastPath };
+  }
+
+  async onConversationTurnRewind(params: unknown): Promise<{ ok: boolean; deletedMessages: number; invalidatedSummaries: number; transcriptRemovedEntries: number; affectedConversations: number[]; rewoundMessageIds: string[]; plannedMessages?: number; staleSummaries?: number; deletedEmptySummaries?: number; discordDeleted?: number; discordDeleteFailed?: number; discordDeleteAttempted?: number; dryRun?: boolean; reason?: string; }> {
+    this.ensureMigrated();
+    const event = this.normalizeConversationTurnRewindEvent(params);
+    const effectiveSessionKey = this.enhanceSessionKeyFromDiscordThreadEvent({ provider: event.provider, channelId: event.channelId, threadId: event.threadId, sessionKey: this.enhanceSessionKeyFromSessionFile(event.sessionKey, event.sessionFile) });
+    return this.withSessionQueue(this.resolveSessionQueueKey(event.sessionId, effectiveSessionKey), async () => {
+      const conversation = event.sessionId || effectiveSessionKey ? await this.conversationStore.getConversationForSession({ sessionId: event.sessionId, sessionKey: effectiveSessionKey }) : null;
+      if (!conversation) return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [], rewoundMessageIds: [], plannedMessages: 0, dryRun: event.dryRun === true, reason: "no-current-conversation" };
+      const messages = await this.conversationStore.getMessages(conversation.conversationId);
+      const userMessages = messages.filter((message) => message.role === "user");
+      const visibleSourceUserMessages = userMessages.filter((message) => Boolean(message.sourceMessageId?.trim()));
+      const rewindUserMessages = event.provider === "discord" && visibleSourceUserMessages.length > 0 ? visibleSourceUserMessages : userMessages;
+      if (rewindUserMessages.length === 0) return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [conversation.conversationId], rewoundMessageIds: [], plannedMessages: 0, dryRun: event.dryRun === true, reason: "no-user-turns" };
+      const selectedTurns = rewindUserMessages.slice(-event.turns);
+      const cutSeq = selectedTurns[0]?.seq;
+      if (cutSeq == null) return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [conversation.conversationId], rewoundMessageIds: [], plannedMessages: 0, dryRun: event.dryRun === true, reason: "no-cutpoint" };
+      const messagesToDelete = messages.filter((message) => message.seq >= cutSeq);
+      const messageIds = Array.from(new Set(messagesToDelete.map((message) => message.messageId)));
+      const rewoundSourceMessageIds = Array.from(new Set(messagesToDelete.map((message) => message.sourceMessageId).filter((id): id is string => Boolean(id?.trim()))));
+      const visibleDiscordMessageIds = this.collectDiscordMessageIdsForVisibleDelete(messagesToDelete);
+      const cutpointSourceMessageId = selectedTurns[0]?.sourceMessageId ?? rewoundSourceMessageIds[0];
+      if (event.dryRun === true) return { ok: true, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [conversation.conversationId], rewoundMessageIds: visibleDiscordMessageIds.length > 0 ? visibleDiscordMessageIds : rewoundSourceMessageIds, plannedMessages: messageIds.length, discordDeleteAttempted: visibleDiscordMessageIds.length, dryRun: true, reason: "dry-run" };
+      const summaryRollback = await this.summaryStore.pruneSummaryMessageLinksAndMarkDependentsStale({ messageIds, reason: event.reason ?? "turn-rewind" });
+      const transcriptFallbackSessionFiles = this.resolveLikelySessionFilesForTurnRewind({ sessionFile: event.sessionFile, sessionId: event.sessionId || conversation.sessionId, threadId: event.threadId, conversationId: conversation.conversationId });
+      const deletedMessages = await this.conversationStore.deleteMessages(messageIds);
+      this.invalidateConversationRuntimeCaches(conversation.conversationId);
+      this.db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(conversation.conversationId);
+      this.markRootSummariesStaleForConversation(conversation.conversationId);
+      const fallbackCutpointSourceMessageId = messagesToDelete.find((message) => message.sourceMessageId?.trim())?.sourceMessageId;
+      const transcriptCutpointSourceMessageId = cutpointSourceMessageId ?? fallbackCutpointSourceMessageId;
+      const transcript = event.deleteTranscript === false || !transcriptCutpointSourceMessageId ? { removedEntries: 0, bytesFreed: 0 } : await this.rewriteTranscriptForSourceRewind({ sessionFile: event.sessionFile, fallbackSessionFiles: transcriptFallbackSessionFiles, messageId: transcriptCutpointSourceMessageId, rewriteActiveSession: event.rewriteActiveSession });
+      // Keep the privacy-critical rewind atomic for local state first. Discord
+      // deletion is intentionally last: if the provider/API is slow or fails,
+      // the command must not leave deleted UI messages lingering in LCM or the
+      // active transcript.
+      const discordDelete = event.deleteDiscord === true ? await this.deleteDiscordMessagesForRewind({ channelId: this.resolveDiscordDeleteChannelId(event), messageIds: visibleDiscordMessageIds, targetUserMessageIds: selectedTurns.map((message) => message.sourceMessageId).filter((id): id is string => Boolean(id?.trim())), deleteBotReplies: true }) : { attempted: 0, deleted: 0, failed: 0, failures: [] };
+      this.deps.log.info(`[lcm] turn rewind reconciled provider=${event.provider ?? "unknown"} channel=${event.channelId ?? "unknown"} thread=${event.threadId ?? "none"} turns=${event.turns} deletedMessages=${deletedMessages} discordDeleted=${discordDelete.deleted} discordFailed=${discordDelete.failed} staleSummaries=${summaryRollback.staleSummaries} deletedEmptySummaries=${summaryRollback.deletedEmptySummaries} transcriptRemovedEntries=${transcript.removedEntries}`);
+      return { ok: true, deletedMessages, invalidatedSummaries: summaryRollback.staleSummaries + summaryRollback.deletedEmptySummaries, transcriptRemovedEntries: transcript.removedEntries, affectedConversations: [conversation.conversationId], rewoundMessageIds: visibleDiscordMessageIds.length > 0 ? visibleDiscordMessageIds : rewoundSourceMessageIds, plannedMessages: messageIds.length, discordDeleted: discordDelete.deleted, discordDeleteFailed: discordDelete.failed, discordDeleteAttempted: discordDelete.attempted, staleSummaries: summaryRollback.staleSummaries, deletedEmptySummaries: summaryRollback.deletedEmptySummaries, dryRun: false };
+    }, { operationName: "turn-rewind", context: [ ...(event.sessionId ? [`session=${event.sessionId}`] : []), ...(effectiveSessionKey ? [`sessionKey=${effectiveSessionKey}`] : []), `turns=${event.turns}` ].join(" ") });
+  }
+
+  async onSourceRewind(params: unknown): Promise<{
+    ok: boolean;
+    deletedMessages: number;
+    invalidatedSummaries: number;
+    transcriptRemovedEntries: number;
+    affectedConversations: number[];
+    rewoundMessageIds: string[];
+    plannedMessages?: number;
+    staleSummaries?: number;
+    deletedEmptySummaries?: number;
+    dryRun?: boolean;
+    reason?: string;
+  }> {
+    this.ensureMigrated();
+    const event = this.normalizeSourceRewindEvent(params);
+    if (!event.messageId) {
+      return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [], rewoundMessageIds: [], reason: "missing-message-id" };
+    }
+    const effectiveSessionKey = this.enhanceSessionKeyFromSessionFile(event.sessionKey, event.sessionFile);
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(event.sessionId, effectiveSessionKey),
+      async () => {
+        const conversation = event.sessionId || effectiveSessionKey
+          ? await this.conversationStore.getConversationForSession({ sessionId: event.sessionId, sessionKey: effectiveSessionKey })
+          : null;
+        const matches = [] as Awaited<ReturnType<ConversationStore["findMessagesBySource"]>>;
+        const pushUniqueMatches = (items: typeof matches) => {
+          const seen = new Set(matches.map((message) => message.messageId));
+          for (const item of items) {
+            if (seen.has(item.messageId)) continue;
+            seen.add(item.messageId);
+            matches.push(item);
+          }
+        };
+        // Prefer real source columns over content substring fallback. Some tool
+        // outputs naturally contain Discord message ids and must not become the
+        // rewind cut point.
+        pushUniqueMatches(await this.conversationStore.findMessagesBySource({
+          conversationId: conversation?.conversationId,
+          provider: event.provider,
+          channelId: event.channelId,
+          threadId: event.threadId,
+          messageId: event.messageId,
+        }));
+        if (matches.length === 0 && event.provider) {
+          pushUniqueMatches(await this.conversationStore.findMessagesBySource({
+            conversationId: conversation?.conversationId,
+            channelId: event.channelId,
+            threadId: event.threadId,
+            messageId: event.messageId ?? "",
+          }));
+        }
+        if (matches.length === 0 && (event.channelId || event.threadId)) {
+          pushUniqueMatches(await this.conversationStore.findMessagesBySource({
+            conversationId: conversation?.conversationId,
+            messageId: event.messageId ?? "",
+          }));
+        }
+        if (matches.length === 0) {
+          pushUniqueMatches(await this.conversationStore.findMessagesBySource({
+            provider: event.provider,
+            channelId: event.channelId,
+            threadId: event.threadId,
+            messageId: event.messageId,
+          }));
+          if (matches.length === 0 && event.provider) {
+            pushUniqueMatches(await this.conversationStore.findMessagesBySource({
+              channelId: event.channelId,
+              threadId: event.threadId,
+              messageId: event.messageId ?? "",
+            }));
+          }
+          if (matches.length === 0) {
+            pushUniqueMatches(await this.conversationStore.findMessagesBySource({ messageId: event.messageId }));
+          }
+        }
+        if (matches.length === 0 && event.allowContentFallback === true) {
+          pushUniqueMatches(await this.conversationStore.findMessagesContainingSourceMessageId({
+            conversationId: conversation?.conversationId,
+            messageId: event.messageId ?? "",
+          }));
+          if (matches.length === 0) {
+            pushUniqueMatches(await this.conversationStore.findMessagesContainingSourceMessageId({ messageId: event.messageId ?? "" }));
+          }
+        }
+        if (matches.length === 0) {
+          return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [], rewoundMessageIds: [], plannedMessages: 0, dryRun: event.dryRun === true, reason: "no-source-match" };
+        }
+        const matchedConversationIds = Array.from(new Set(matches.map((message) => message.conversationId)));
+        if (matchedConversationIds.length !== 1 && event.allowAmbiguous !== true) {
+          return { ok: false, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: matchedConversationIds, rewoundMessageIds: [], plannedMessages: 0, dryRun: event.dryRun === true, reason: "ambiguous-source-match" };
+        }
+        const cutMessagesByConversation = new Map<number, number>();
+        for (const match of matches) {
+          const current = cutMessagesByConversation.get(match.conversationId);
+          if (current === undefined || match.seq < current) cutMessagesByConversation.set(match.conversationId, match.seq);
+        }
+        const messagesToDelete = [] as Awaited<ReturnType<ConversationStore["listMessagesAfterSeq"]>>;
+        for (const [conversationId, seq] of cutMessagesByConversation) {
+          messagesToDelete.push(...await this.conversationStore.listMessagesAfterSeq(conversationId, seq));
+        }
+        const rewoundSourceMessageIds = Array.from(new Set(messagesToDelete.map((message) => message.sourceMessageId).filter((id): id is string => Boolean(id?.trim()))));
+        const messageIds = Array.from(new Set(messagesToDelete.map((message) => message.messageId)));
+        const affectedConversationIds = Array.from(new Set([...matches.map((message) => message.conversationId), ...messagesToDelete.map((message) => message.conversationId)]));
+        if (event.dryRun === true) {
+          return {
+            ok: true,
+            deletedMessages: 0,
+            invalidatedSummaries: 0,
+            transcriptRemovedEntries: 0,
+            affectedConversations: affectedConversationIds,
+            rewoundMessageIds: rewoundSourceMessageIds,
+            plannedMessages: messageIds.length,
+            dryRun: true,
+            reason: "dry-run",
+          };
+        }
+        if (event.recordTombstone === true) {
+          this.recordSourceDeletion({
+            provider: event.provider,
+            channelId: event.channelId,
+            threadId: event.threadId,
+            messageIds: rewoundSourceMessageIds.length > 0 ? rewoundSourceMessageIds : event.messageId ? [event.messageId] : [],
+          });
+        }
+        const summaryRollback = await this.summaryStore.pruneSummaryMessageLinksAndMarkDependentsStale({
+          messageIds,
+          reason: event.reason ?? "source-rewind",
+        });
+        const invalidatedSummaries = summaryRollback.staleSummaries + summaryRollback.deletedEmptySummaries;
+        const transcriptFallbackSessionFiles = affectedConversationIds.length > 0
+          ? this.db.prepare(`SELECT session_file_path FROM conversation_bootstrap_state WHERE conversation_id IN (${affectedConversationIds.map(() => "?").join(",")})`)
+              .all(...affectedConversationIds)
+              .map((row) => (row as { session_file_path?: unknown }).session_file_path)
+              .filter((sessionFile): sessionFile is string => typeof sessionFile === "string" && sessionFile.length > 0)
+          : [];
+        const deletedMessages = await this.conversationStore.deleteMessages(messageIds);
+        for (const conversationId of affectedConversationIds) {
+          this.invalidateConversationRuntimeCaches(conversationId);
+          this.db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(conversationId);
+          this.markRootSummariesStaleForConversation(conversationId);
+        }
+        const transcript = event.deleteTranscript === false
+          ? { removedEntries: 0, bytesFreed: 0 }
+          : await this.rewriteTranscriptForSourceRewind({
+              sessionFile: event.sessionFile,
+              fallbackSessionFiles: transcriptFallbackSessionFiles,
+              messageId: event.messageId ?? "",
+              rewriteActiveSession: event.rewriteActiveSession,
+            });
+        this.deps.log.info(
+          `[lcm] source rewind reconciled provider=${event.provider ?? "unknown"} channel=${event.channelId ?? "unknown"} thread=${event.threadId ?? "none"} cutMessage=${event.messageId} deletedMessages=${deletedMessages} staleSummaries=${summaryRollback.staleSummaries} deletedEmptySummaries=${summaryRollback.deletedEmptySummaries} transcriptRemovedEntries=${transcript.removedEntries}`,
+        );
+        return {
+          ok: true,
+          deletedMessages,
+          invalidatedSummaries,
+          transcriptRemovedEntries: transcript.removedEntries,
+          affectedConversations: affectedConversationIds,
+          rewoundMessageIds: rewoundSourceMessageIds,
+          plannedMessages: messageIds.length,
+          staleSummaries: summaryRollback.staleSummaries,
+          deletedEmptySummaries: summaryRollback.deletedEmptySummaries,
+          dryRun: false,
+        };
+      },
+      {
+        operationName: "source-rewind",
+        context: [
+          ...(event.sessionId ? [`session=${event.sessionId}`] : []),
+          ...(effectiveSessionKey ? [`sessionKey=${effectiveSessionKey}`] : []),
+          `message=${event.messageId}`,
+        ].join(" "),
+      },
+    );
+  }
+
+  async onSourceDeleted(params: unknown): Promise<{
+    ok: boolean;
+    deletedMessages: number;
+    invalidatedSummaries: number;
+    transcriptRemovedEntries: number;
+    affectedConversations: number[];
+    reason?: string;
+  }> {
+    this.ensureMigrated();
+    const event = this.normalizeSourceDeletionEvent(params);
+    if (!event.messageIds || event.messageIds.length === 0) {
+      return { ok: true, deletedMessages: 0, invalidatedSummaries: 0, transcriptRemovedEntries: 0, affectedConversations: [], reason: "no-message-ids" };
+    }
+    const effectiveSessionKey = this.enhanceSessionKeyFromSessionFile(event.sessionKey, event.sessionFile);
+    return this.withSessionQueue(
+      this.resolveSessionQueueKey(event.sessionId, effectiveSessionKey),
+      async () => {
+        this.recordSourceDeletion(event);
+        const conversation = event.sessionId || effectiveSessionKey
+          ? await this.conversationStore.getConversationForSession({ sessionId: event.sessionId, sessionKey: effectiveSessionKey })
+          : null;
+        const matches = [] as Awaited<ReturnType<ConversationStore["findMessagesBySource"]>>;
+        for (const messageId of event.messageIds ?? []) {
+          const scopedSourceMatches = await this.conversationStore.findMessagesBySource({
+            conversationId: conversation?.conversationId,
+            provider: event.provider,
+            channelId: event.channelId,
+            threadId: event.threadId,
+            messageId,
+          });
+          const scopedContentMatches = await this.conversationStore.findMessagesContainingSourceMessageId({
+            conversationId: conversation?.conversationId,
+            messageId,
+          });
+          matches.push(...scopedSourceMatches, ...scopedContentMatches);
+          if (scopedSourceMatches.length === 0 && scopedContentMatches.length === 0) {
+            matches.push(...await this.conversationStore.findMessagesBySource({
+              provider: event.provider,
+              channelId: event.channelId,
+              threadId: event.threadId,
+              messageId,
+            }));
+            matches.push(...await this.conversationStore.findMessagesContainingSourceMessageId({ messageId }));
+          }
+        }
+        const messageIds = Array.from(new Set(matches.map((message) => message.messageId)));
+        const affectedConversationIds = Array.from(new Set(matches.map((message) => message.conversationId)));
+        this.deps.log.info(
+          `[lcm] source deletion match debug provider=${event.provider ?? "unknown"} channel=${event.channelId ?? "unknown"} thread=${event.threadId ?? "none"} messages=${event.messageIds?.length ?? 0} matches=${matches.length} lcmMessageIds=${messageIds.slice(0, 20).join(",") || "none"} conversation=${conversation?.conversationId ?? "none"}`,
+        );
+        const coveredSummaryIds = await this.summaryStore.getSummaryIdsCoveringMessages(messageIds);
+        const invalidatedSummaries = await this.summaryStore.deleteSummaries(coveredSummaryIds);
+        const transcriptFallbackSessionFiles = affectedConversationIds.length > 0
+          ? this.db.prepare(`SELECT session_file_path FROM conversation_bootstrap_state WHERE conversation_id IN (${affectedConversationIds.map(() => "?").join(",")})`)
+              .all(...affectedConversationIds)
+              .map((row) => (row as { session_file_path?: unknown }).session_file_path)
+              .filter((sessionFile): sessionFile is string => typeof sessionFile === "string" && sessionFile.length > 0)
+          : [];
+        const deletedMessages = await this.conversationStore.deleteMessages(messageIds);
+        for (const conversationId of affectedConversationIds) {
+          this.invalidateConversationRuntimeCaches(conversationId);
+          this.db.prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`).run(conversationId);
+          this.markRootSummariesStaleForConversation(conversationId);
+        }
+        const transcript = event.deleteTranscript === false
+          ? { removedEntries: 0, bytesFreed: 0 }
+          : await this.rewriteTranscriptForSourceDeletion({
+          sessionFile: event.sessionFile,
+          messageIds: event.messageIds ?? [],
+          fallbackSessionFiles: transcriptFallbackSessionFiles,
+          rewriteActiveSession: event.rewriteActiveSession,
+        });
+        this.deps.log.info(
+          `[lcm] source deletion reconciled provider=${event.provider ?? "unknown"} channel=${event.channelId ?? "unknown"} thread=${event.threadId ?? "none"} messages=${event.messageIds?.length ?? 0} deletedMessages=${deletedMessages} invalidatedSummaries=${invalidatedSummaries} transcriptRemovedEntries=${transcript.removedEntries}`,
+        );
+        return {
+          ok: true,
+          deletedMessages,
+          invalidatedSummaries,
+          transcriptRemovedEntries: transcript.removedEntries,
+          affectedConversations: affectedConversationIds,
+        };
+      },
+      {
+        operationName: "source-delete",
+        context: [
+          ...(event.sessionId ? [`session=${event.sessionId}`] : []),
+          ...(effectiveSessionKey ? [`sessionKey=${effectiveSessionKey}`] : []),
+          `messages=${event.messageIds.length}`,
+        ].join(" "),
+      },
+    );
   }
 
   /** Normalize optional live token estimates supplied by runtime callers. */
@@ -6142,6 +7037,7 @@ export class LcmContextEngine implements ContextEngine {
       role: stored.role,
       content: stored.content,
       tokenCount: stored.tokenCount,
+      source: extractSourceIdentityFromMessage(messageForParts),
     });
     await this.conversationStore.createMessageParts(
       msgRecord.messageId,
@@ -6655,10 +7551,11 @@ export class LcmContextEngine implements ContextEngine {
     // Return a new fallback array so the runtime hook treats this as assembled
     // context, and remove assistant prefill tails from fallback-only paths.
     const safeFallback = (opts?: { preserveIdentity?: boolean }): AssembleResult => {
-      const msgs = opts?.preserveIdentity ? params.messages : params.messages.slice();
+      const filtered = this.filterDeletedLiveMessages(params.messages);
+      const msgs = opts?.preserveIdentity ? filtered : filtered.slice();
       while (msgs.length > 0 && msgs[msgs.length - 1]?.role === "assistant") {
         if (opts?.preserveIdentity) {
-          return { messages: params.messages.slice(0, -1), estimatedTokens: 0 };
+          return { messages: filtered.slice(0, -1), estimatedTokens: 0 };
         }
         msgs.pop();
       }

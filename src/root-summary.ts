@@ -141,6 +141,7 @@ function extractKeywords(content: string): string[] {
     ["compaction", /\bcompaction|compact(?:ed|ion)?|summary\s+dag|frontier\b/g, 4],
     ["session-identity", /\bsession[-_ ]?key|conversation[_ ]id|discord\s+(?:channel|thread)|thread\s+membership\b/g, 4],
     ["lcm-db", /\blcm\s*(?:db|database)|sqlite|fts5\b/g, 4],
+    ["rewind", /\brewind|source\s+(?:delete|deleted|update|replacement)|surgical\b/g, 4],
     ["memory", /\bmemory|MEMORY\.md|long[- ]term\b/g, 3],
     ["clawbank", /\bclawbank|#clawbank\b/g, 5],
     ["crypto-research", /\bcrypto|token|dexscreener|research\b/g, 3],
@@ -755,6 +756,7 @@ const BANNED_EXACT_KEYWORDS = new Set([
   "session-identity",
   "memory-architecture",
   "lcm-database",
+  "source-rewind",
   // Prompt/schema instruction fragments leaked by failed keyword review calls.
   "rules",
   "title",
