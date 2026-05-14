@@ -224,6 +224,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "invalidateScopedRootIndicesForStrictVisibility", algorithm_version: 1 },
     ]);
 
     const depthRows = db
@@ -1122,7 +1123,41 @@ describe("runLcmMigrations summary depth backfill", () => {
       "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
+      "[lcm] migration step skipped: step=invalidateScopedRootIndicesForStrictVisibility algorithmVersion=1 reason=already-complete",
     ]);
+  });
+
+  it("marks existing root indices stale once for strict visibility regeneration", () => {
+    const db = createTestDb("root-index-stale-migration.db");
+    db.exec(`
+      CREATE TABLE root_summaries (
+        root_key TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        source_conversation_ids TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL,
+        stale INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    db.prepare(
+      `INSERT INTO root_summaries (root_key, content, token_count, source_conversation_ids, updated_at, stale)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("channel:111111111", "old permissive index", 5, "[]", "2026-05-01T00:00:00Z", 0);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const migrated = db.prepare(
+      `SELECT stale FROM root_summaries WHERE root_key = ?`,
+    ).get("channel:111111111") as { stale: number };
+    expect(migrated.stale).toBe(1);
+
+    db.prepare("UPDATE root_summaries SET stale = 0 WHERE root_key = ?").run("channel:111111111");
+    runLcmMigrations(db, { fts5Available: false });
+
+    const afterSecondRun = db.prepare(
+      `SELECT stale FROM root_summaries WHERE root_key = ?`,
+    ).get("channel:111111111") as { stale: number };
+    expect(afterSecondRun.stale).toBe(0);
   });
 
   it("wraps the full migration in one exclusive transaction", () => {
@@ -1217,6 +1252,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "invalidateScopedRootIndicesForStrictVisibility", algorithm_version: 1 },
     ]);
   });
 });

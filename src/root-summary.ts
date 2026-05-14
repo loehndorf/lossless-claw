@@ -546,8 +546,7 @@ function guildIdForSessionKey(sessionKey: string, channelMembers: Map<string, Ch
 }
 
 function sameOrCompatibleGuild(rootGuildId: string | null | undefined, targetGuildId: string | null | undefined): boolean {
-  if (rootGuildId === undefined || targetGuildId === undefined) return false;
-  if (rootGuildId === null || targetGuildId === null) return rootGuildId === targetGuildId;
+  if (!rootGuildId || !targetGuildId) return false;
   return rootGuildId === targetGuildId;
 }
 
@@ -588,11 +587,11 @@ function rootCanIndexConversation(
     return true;
   }
 
-  // Cross-session index entries are allowed only inside the same Discord guild
-  // and only when the target audience is a superset of the current root audience.
-  // This preserves useful navigation to visible/broader channels while avoiding
-  // the earlier bug where open channels from unrelated Discord servers leaked
-  // into this session's root index.
+  // Cross-session index entries are allowed only inside a known same Discord
+  // guild and only when the target audience is a superset of the current root
+  // audience. Unknown guild ids fail closed; otherwise open channels from
+  // unrelated servers can look compatible just because both rows lack guild
+  // metadata.
   const rootGuild = guildIdForRootKey(rootKey, channelMembershipInfo);
   const targetGuild = guildIdForSessionKey(sourceSessionKey, channelMembershipInfo);
   if (!sameOrCompatibleGuild(rootGuild, targetGuild)) return false;
