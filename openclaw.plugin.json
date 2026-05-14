@@ -479,7 +479,8 @@
                 "additionalProperties": false,
                 "properties": {
                     "enabled": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "default": true
                     },
                     "rulesFile": {
                         "type": "string"
@@ -511,6 +512,7 @@
                     },
                     "defaultPolicy": {
                         "type": "string",
+                        "default": "owner-only",
                         "enum": [
                             "owner-only",
                             "open"
@@ -518,6 +520,7 @@
                     },
                     "userIdSource": {
                         "type": "string",
+                        "default": "sender-id",
                         "enum": [
                             "session-key",
                             "sender-id"
@@ -546,24 +549,29 @@
                 "additionalProperties": false,
                 "properties": {
                     "enabled": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "default": true
                     },
                     "maxTokens": {
                         "type": "integer",
-                        "minimum": 1
+                        "minimum": 1,
+                        "default": 2000
                     },
                     "scope": {
                         "type": "string",
+                        "default": "user",
                         "enum": [
                             "user"
                         ]
                     },
                     "minAgeMinutes": {
                         "type": "integer",
-                        "minimum": 0
+                        "minimum": 0,
+                        "default": 0
                     },
                     "customInstructions": {
-                        "type": "string"
+                        "type": "string",
+                        "default": ""
                     }
                 }
             },
@@ -572,15 +580,18 @@
                 "additionalProperties": false,
                 "properties": {
                     "enabled": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "default": true
                     },
                     "hour": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 23
+                        "maximum": 23,
+                        "default": 4
                     },
                     "forceFreshTail": {
-                        "type": "boolean"
+                        "type": "boolean",
+                        "default": true
                     }
                 }
             }

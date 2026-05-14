@@ -30,6 +30,7 @@ import {
   pickToolName,
   type AssemblyOverflowDiagnostics,
 } from "./assembler.js";
+import { diagnoseChannelMembershipCoverage, runAutoDiscovery } from "./auto-discovery.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -1888,7 +1889,6 @@ export class LcmContextEngine implements ContextEngine {
     // Run auto-discovery for channel membership after migration
     if (migrationOk) {
       try {
-        const { runAutoDiscovery } = require("./auto-discovery.js") as typeof import("./auto-discovery.js");
         const result = runAutoDiscovery(this.db);
         if (result.entriesUpserted > 0) {
           this.deps.log.info(
@@ -1896,6 +1896,23 @@ export class LcmContextEngine implements ContextEngine {
           );
         } else {
           this.deps.log.debug("[lcm] Auto-discovery: no new channel memberships found");
+        }
+        const visibilityConfig = this.config.visibility;
+        if (
+          visibilityConfig?.enabled === true
+          && visibilityConfig.defaultPolicy !== "open"
+        ) {
+          const coverage = diagnoseChannelMembershipCoverage(this.db, visibilityConfig.channelMembers);
+          if (coverage.missingMembershipCount > 0) {
+            const rootIndexClause = this.config.rootSummary?.enabled === true
+              ? " and root-index entries"
+              : "";
+            logStartupBannerOnce({
+              key: "visibility-channel-membership-missing",
+              log: (message) => this.deps.log.warn(message),
+              message: `[lcm] Multi-session visibility is enabled, but channel membership is unknown for ${coverage.missingMembershipCount}/${coverage.channelScopeCount} Discord channel/thread scope(s); cross-channel recall${rootIndexClause} for those scopes will fail closed until OpenClaw supplies channel_membership data or visibility.channelMembers is configured. DMs remain owner-only.`,
+            });
+          }
         }
       } catch (e) {
         this.deps.log.warn(

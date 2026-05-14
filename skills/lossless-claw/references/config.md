@@ -448,13 +448,38 @@ Default:
 
 ## Multi-session visibility and root indices
 
+Default Discord setup:
+
+```json
+{
+  "visibility": {
+    "enabled": true,
+    "defaultPolicy": "owner-only",
+    "userIdSource": "sender-id",
+    "channelMembers": {}
+  },
+  "rootSummary": {
+    "enabled": true,
+    "maxTokens": 2000,
+    "minAgeMinutes": 0
+  },
+  "nightlyCompaction": {
+    "enabled": true,
+    "hour": 4,
+    "forceFreshTail": true
+  }
+}
+```
+
+This is enabled by default and keeps cross-session recall private by default while allowing visible sessions to appear in root indices. DMs are owner-only. Discord channel/thread sharing works when the host integration or a trusted tool populates `channel_membership`, or when you provide the manual `visibility.channelMembers` fallback. Until membership data exists, those sessions fail closed and a startup warning explains why cross-channel recall/root-index entries are unavailable.
+
 ### `visibility`
 
 Controls which sessions can read memory from other sessions.
 
 Defaults:
 
-- `enabled: false`
+- `enabled: true`
 - `rules: []`
 - `defaultPolicy: "owner-only"`
 - `userIdSource: "sender-id"`
@@ -473,7 +498,7 @@ Legacy config key for visibility-scoped root indices. The per-session root summa
 
 Defaults:
 
-- `enabled: false`
+- `enabled: true`
 - `maxTokens: 2000`
 - `scope: "user"`
 - `minAgeMinutes: 0`
@@ -483,7 +508,7 @@ Why it matters:
 
 - each visible scope receives a compact index of visible sessions organized by channel/thread plus session keywords
 - root indices are stale-marked when underlying visible summaries change and are regenerated on demand or during maintenance
-- `rootSummary.enabled` should be paired with `visibility.enabled`
+- `rootSummary.enabled` is paired with `visibility.enabled` by default
 
 ### `nightlyCompaction`
 
@@ -491,9 +516,9 @@ Controls the built-in background maintenance sweep.
 
 Defaults:
 
-- `enabled: false`
+- `enabled: true`
 - `hour: 4`
-- `forceFreshTail: false`
+- `forceFreshTail: true`
 
 Why it matters:
 

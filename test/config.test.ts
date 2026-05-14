@@ -54,12 +54,38 @@ describe("resolveLcmConfig", () => {
       max: 40000,
     });
     expect(config.rootSummary).toEqual({
-      enabled: false,
+      enabled: true,
       maxTokens: 2000,
       scope: "user",
       minAgeMinutes: 0,
       customInstructions: "",
     });
+    expect(config.visibility).toEqual({
+      enabled: true,
+      rules: [],
+      defaultPolicy: "owner-only",
+      userIdSource: "sender-id",
+      channelMembers: undefined,
+    });
+    expect(config.nightlyCompaction).toEqual({
+      enabled: true,
+      hour: 4,
+      forceFreshTail: true,
+    });
+  });
+
+  it("allows multi-session defaults to be disabled explicitly", () => {
+    const config = resolveLcmConfig(
+      {
+        LCM_VISIBILITY_ENABLED: "false",
+        LCM_ROOT_SUMMARY_ENABLED: "false",
+        LCM_NIGHTLY_COMPACTION_ENABLED: "false",
+      } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.visibility.enabled).toBe(false);
+    expect(config.rootSummary.enabled).toBe(false);
+    expect(config.nightlyCompaction.enabled).toBe(false);
   });
 
   it("reads values from plugin config", () => {
@@ -872,9 +898,17 @@ describe("resolveLcmConfig nightlyCompactHour", () => {
   });
 
   it("reads nightlyCompaction.enabled from plugin config and env", () => {
+    expect(resolveLcmConfig({}, {}).nightlyCompaction.enabled).toBe(true);
+    expect(resolveLcmConfig({}, { nightlyCompaction: { enabled: false } }).nightlyCompaction.enabled).toBe(false);
     expect(resolveLcmConfig({}, { nightlyCompaction: { enabled: true } }).nightlyCompaction.enabled).toBe(true);
     expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_ENABLED: "true" } as NodeJS.ProcessEnv, {}).nightlyCompaction.enabled).toBe(true);
     expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_ENABLED: "false" } as NodeJS.ProcessEnv, { nightlyCompaction: { enabled: true } }).nightlyCompaction.enabled).toBe(false);
+  });
+
+  it("enables forced fresh-tail nightly summaries by default", () => {
+    expect(resolveLcmConfig({}, {}).nightlyCompaction.forceFreshTail).toBe(true);
+    expect(resolveLcmConfig({}, { nightlyCompaction: { forceFreshTail: false } }).nightlyCompaction.forceFreshTail).toBe(false);
+    expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL: "false" } as NodeJS.ProcessEnv, {}).nightlyCompaction.forceFreshTail).toBe(false);
   });
 
   it("env overrides plugin config", () => {

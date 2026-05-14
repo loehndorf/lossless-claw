@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
-import { runAutoDiscovery, ensureChannelMembershipTable, upsertChannelMembership } from "../src/auto-discovery.js";
+import { runAutoDiscovery, ensureChannelMembershipTable, upsertChannelMembership, diagnoseChannelMembershipCoverage } from "../src/auto-discovery.js";
 
 function createTestDB(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -82,6 +82,68 @@ describe("auto-discovery", () => {
     expect(row.is_open).toBe(0);
     expect(JSON.parse(row.member_ids)).toEqual([]);
     expect(row.source).toBe("auto");
+
+    db.close();
+  });
+
+  it("diagnoses channel conversations that will fail closed without membership data", () => {
+    const db = createTestDB();
+    ensureChannelMembershipTable(db);
+
+    db.prepare("INSERT INTO conversations (session_id, session_key) VALUES (?, ?)").run(
+      "test-session-1",
+      "agent:main:discord:channel:123456789",
+    );
+
+    runAutoDiscovery(db);
+    const coverage = diagnoseChannelMembershipCoverage(db);
+
+    expect(coverage.channelScopeCount).toBe(1);
+    expect(coverage.configuredChannelCount).toBe(0);
+    expect(coverage.cachedMembershipCount).toBe(0);
+    expect(coverage.missingMembershipCount).toBe(1);
+    expect(coverage.missingMembershipChannelIds).toEqual(["123456789"]);
+
+    db.close();
+  });
+
+  it("treats configured channel membership as covered", () => {
+    const db = createTestDB();
+    ensureChannelMembershipTable(db);
+
+    db.prepare("INSERT INTO conversations (session_id, session_key) VALUES (?, ?)").run(
+      "test-session-1",
+      "agent:main:discord:channel:123456789",
+    );
+
+    runAutoDiscovery(db);
+    const coverage = diagnoseChannelMembershipCoverage(db, {
+      "123456789": ["111111"],
+    });
+
+    expect(coverage.configuredChannelCount).toBe(1);
+    expect(coverage.cachedMembershipCount).toBe(0);
+    expect(coverage.missingMembershipCount).toBe(0);
+
+    db.close();
+  });
+
+  it("treats trusted cached channel membership as covered", () => {
+    const db = createTestDB();
+    ensureChannelMembershipTable(db);
+
+    upsertChannelMembership(db, "123456789", false, ["111111"], "auto");
+    db.prepare("INSERT INTO conversations (session_id, session_key) VALUES (?, ?)").run(
+      "test-session-1",
+      "agent:main:discord:channel:123456789",
+    );
+
+    runAutoDiscovery(db);
+    const coverage = diagnoseChannelMembershipCoverage(db);
+
+    expect(coverage.configuredChannelCount).toBe(0);
+    expect(coverage.cachedMembershipCount).toBe(1);
+    expect(coverage.missingMembershipCount).toBe(0);
 
     db.close();
   });

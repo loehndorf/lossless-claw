@@ -9,11 +9,12 @@
  *
  * Visibility rules are deterministic:
  *   - DMs: only the DM participant can see their own DMs (derived from session key)
- *   - Channels: only members can see channel content (derived from Discord permissions)
+ *   - Channels: only known members can see channel content
  *   - Unknown sessions: denied by default
  *
- * Channel membership is auto-discovered from Discord API and cached.
- * No manual configuration required for standard deployments.
+ * Channel membership is not inferred from chat transcripts. The plugin can
+ * create closed placeholder rows for known channels; real membership/open-state
+ * must come from the host integration, permission discovery, or explicit config.
  *
  * ## channelMembersMap semantics
  *
@@ -60,7 +61,7 @@ export interface VisibilityConfig {
 }
 
 export const DEFAULT_VISIBILITY_CONFIG: VisibilityConfig = {
-  enabled: false,
+  enabled: true,
   defaultPolicy: "owner-only",
 };
 
@@ -79,13 +80,13 @@ export type ChannelMembersMap = Map<string, string[] | null>;
 
 /**
  * Build the complete channelMembers map.
- * Merges auto-discovered membership from LCM DB cache with config overrides.
+ * Merges cached membership from LCM DB with config overrides.
  * Config overrides take precedence (for non-Discord or special cases).
  *
  * Discovery sources (in priority order):
  * 1. Config overrides (channelMembers in plugin config)
- * 2. Auto-discovered from channel_membership DB table
- * 3. Discord API (future: via plugin hook)
+ * 2. Cached channel_membership DB table entries populated by the host or tools
+ * 3. Closed placeholders for channels whose membership is still unknown
  */
 export function buildChannelMembersMap(
   discoveredMembers?: ChannelMembersMap,
@@ -93,7 +94,7 @@ export function buildChannelMembersMap(
 ): ChannelMembersMap {
   const result: ChannelMembersMap = new Map();
 
-  // Start with auto-discovered membership
+  // Start with cached membership
   if (discoveredMembers) {
     for (const [channelId, members] of discoveredMembers) {
       result.set(channelId, members);
@@ -112,9 +113,9 @@ export function buildChannelMembersMap(
 
 /**
  * Load channel membership from the LCM database cache table.
- * This is the primary auto-discovery mechanism:
- * - The agent periodically discovers channel membership via Discord API
- * - Results are stored in the channel_membership table
+ * The plugin only trusts this table as cached visibility data:
+ * - Host integrations or explicit tools may write real membership/open-state
+ * - Startup auto-discovery writes closed placeholders for unknown channels
  * - This function reads them back for visibility checks
  *
  * Returns a ChannelMembersMap where:
@@ -279,7 +280,7 @@ function combineParentAndThreadAudience(parentMembers: string[] | null, threadMe
  * @param currentUserId The Discord user ID of the person asking
  * @param rules Visibility rules from config (overrides)
  * @param defaultPolicy What to do when no rule matches
- * @param channelMembers Channel membership map (auto-discovered + config overrides)
+ * @param channelMembers Channel membership map (cached + config overrides)
  */
 export function isConversationVisible(
   sessionKey: string,
@@ -326,7 +327,7 @@ export function isConversationVisible(
         return audience.has(currentUserId);
       }
 
-      // Check channel membership (auto-discovered + config overrides)
+      // Check channel membership (cached + config overrides)
       if (channelMembers && channelMembers.has(parsed.identifier)) {
         const members = channelMembers.get(parsed.identifier)!;
         // null = open channel (everyone can see)

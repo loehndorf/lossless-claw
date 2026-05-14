@@ -8,6 +8,7 @@ type StartupBannerKey =
   | "stateless-session-patterns"
   | "ignore-session-patterns-env-override"
   | "stateless-session-patterns-env-override"
+  | "visibility-channel-membership-missing"
   | "state-dir";
 
 type StartupBannerLogState = {

@@ -64,23 +64,23 @@ Most installations only need to override a handful of keys. If you want a comple
     "max": 40000
   },
   "visibility": {
-    "enabled": false,
+    "enabled": true,
     "rules": [],
     "defaultPolicy": "owner-only",
     "userIdSource": "sender-id",
     "channelMembers": {}
   },
   "rootSummary": {
-    "enabled": false,
+    "enabled": true,
     "maxTokens": 2000,
     "scope": "user",
     "minAgeMinutes": 0,
     "customInstructions": ""
   },
   "nightlyCompaction": {
-    "enabled": false,
+    "enabled": true,
     "hour": 4,
-    "forceFreshTail": false
+    "forceFreshTail": true
   }
 }
 ```
@@ -114,6 +114,35 @@ For local plugin development, link a working copy:
 ```bash
 openclaw plugins install --link /path/to/lossless-claw
 ```
+
+Packaged installs build `dist/index.js` automatically before the npm package is created. When using `--link`, run `npm run build` in the linked checkout after code changes so OpenClaw loads the current bundle.
+
+## Default multi-session Discord behavior
+
+Cross-session recall is enabled by default for Discord sessions. The defaults are conservative: DMs are owner-only, unknown channels and threads fail closed, and quiet sessions are summarized during nightly maintenance so they can appear in root indices.
+
+```json
+{
+  "visibility": {
+    "enabled": true,
+    "defaultPolicy": "owner-only",
+    "userIdSource": "sender-id",
+    "channelMembers": {}
+  },
+  "rootSummary": {
+    "enabled": true,
+    "maxTokens": 2000,
+    "minAgeMinutes": 0
+  },
+  "nightlyCompaction": {
+    "enabled": true,
+    "hour": 4,
+    "forceFreshTail": true
+  }
+}
+```
+
+You usually do not need to set this block manually; it shows the built-in defaults. With `defaultPolicy: "owner-only"`, DMs remain private to the DM participant. Discord channel/thread sharing works when the host integration or a trusted tool populates `channel_membership`, or when you provide the manual `visibility.channelMembers` fallback. Until membership data exists, those sessions fail closed and a startup warning explains why cross-channel recall/root-index entries are unavailable. Use `null` for an open channel, `[]` for an explicitly closed channel with no known members, and `["user-id"]` for restricted membership.
 
 ## Reference
 
@@ -206,7 +235,7 @@ Visibility controls cross-session recall. When enabled, every cross-conversation
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `visibility.enabled` | `boolean` | `false` | `LCM_VISIBILITY_ENABLED` | Enables cross-session visibility filtering. |
+| `visibility.enabled` | `boolean` | `true` | `LCM_VISIBILITY_ENABLED` | Enables cross-session visibility filtering. Set `false` to disable cross-session visibility checks and root-index scoping. |
 | `visibility.rulesFile` | `string` | unset | none | Reserved path for external visibility rules. Inline `visibility.rules` are currently the primary config surface. |
 | `visibility.rules` | `Array<{ sessionPattern: string; allowedUsers: string[]; label?: string }>` | `[]` | none | Explicit session-key glob rules. `allowedUsers: []` means open to every requester. |
 | `visibility.defaultPolicy` | `"owner-only" \| "open"` | `"owner-only"` | none | Fallback policy when no explicit rule matches. Owner-only DMs are visible only to the DM participant; channels require membership data. |
@@ -219,7 +248,7 @@ This legacy config key controls the visibility-scoped root index injected at ses
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `rootSummary.enabled` | `boolean` | `false` | `LCM_ROOT_SUMMARY_ENABLED` | Enables visibility-scoped root-index generation and injection. Requires `visibility.enabled`. |
+| `rootSummary.enabled` | `boolean` | `true` | `LCM_ROOT_SUMMARY_ENABLED` | Enables visibility-scoped root-index generation and injection. Requires `visibility.enabled`. |
 | `rootSummary.maxTokens` | `integer` | `2000` | `LCM_ROOT_SUMMARY_MAX_TOKENS` | Maximum approximate token budget for each root index. |
 | `rootSummary.scope` | `"user"` | `"user"` | none | Compatibility field; root indices are materialized by visibility scope. |
 | `rootSummary.minAgeMinutes` | `number` | `0` | `LCM_ROOT_SUMMARY_MIN_AGE_MINUTES` | Minimum conversation age before eager background root-index regeneration includes a conversation. |
@@ -229,9 +258,9 @@ This legacy config key controls the visibility-scoped root index injected at ses
 
 | Key | Type | Default | Env override | Purpose |
 | --- | --- | --- | --- | --- |
-| `nightlyCompaction.enabled` | `boolean` | `false` | `LCM_NIGHTLY_COMPACTION_ENABLED` | Enables the built-in nightly maintenance sweep. |
+| `nightlyCompaction.enabled` | `boolean` | `true` | `LCM_NIGHTLY_COMPACTION_ENABLED` | Enables the built-in nightly maintenance sweep. |
 | `nightlyCompaction.hour` | `integer` | `4` | `LCM_NIGHTLY_COMPACTION_HOUR` or `LCM_NIGHTLY_COMPACT_HOUR` | Local hour for the sweep. |
-| `nightlyCompaction.forceFreshTail` | `boolean` | `false` | `LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL` | Allows forced nightly compaction to summarize the protected fresh tail. |
+| `nightlyCompaction.forceFreshTail` | `boolean` | `true` | `LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL` | Allows forced nightly compaction to summarize the protected fresh tail. |
 
 ### Cache-aware incremental compaction
 

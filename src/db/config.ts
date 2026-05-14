@@ -582,8 +582,8 @@ export function resolveLcmConfigWithDiagnostics(
       visibility: {
         enabled:
           env.LCM_VISIBILITY_ENABLED !== undefined
-            ? env.LCM_VISIBILITY_ENABLED === "true"
-            : toBool(toRecord(pc.visibility)?.enabled) ?? false,
+            ? env.LCM_VISIBILITY_ENABLED !== "false"
+            : toBool(toRecord(pc.visibility)?.enabled) ?? true,
         rulesFile: toStr(toRecord(pc.visibility)?.rulesFile),
         rules: parseVisibilityRules(toRecord(pc.visibility)?.rules),
         defaultPolicy:
@@ -595,8 +595,8 @@ export function resolveLcmConfigWithDiagnostics(
       rootSummary: {
         enabled:
           env.LCM_ROOT_SUMMARY_ENABLED !== undefined
-            ? env.LCM_ROOT_SUMMARY_ENABLED === "true"
-            : toBool(rootSummary?.enabled) ?? false,
+            ? env.LCM_ROOT_SUMMARY_ENABLED !== "false"
+            : toBool(rootSummary?.enabled) ?? true,
         maxTokens:
           Math.max(
             1,
@@ -621,12 +621,12 @@ export function resolveLcmConfigWithDiagnostics(
         enabled:
           env.LCM_NIGHTLY_COMPACTION_ENABLED !== undefined
             ? env.LCM_NIGHTLY_COMPACTION_ENABLED !== "false"
-            : toBool(nightlyCompaction?.enabled) ?? false,
+            : toBool(nightlyCompaction?.enabled) ?? true,
         hour: resolvedNightlyCompactionHour,
         forceFreshTail:
           env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL !== undefined
             ? env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL === "true"
-            : toBool(nightlyCompaction?.forceFreshTail) ?? false,
+            : toBool(nightlyCompaction?.forceFreshTail) ?? true,
       },
       nightlyCompactHour: resolvedNightlyCompactionHour,
     },
