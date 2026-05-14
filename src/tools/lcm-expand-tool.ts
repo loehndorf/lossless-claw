@@ -15,6 +15,7 @@ import {
 } from "../expansion.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { resolveVisibilityScopedConversations } from "./lcm-visibility-scope.js";
 import {
   normalizeSummaryIds,
   runDelegatedExpansionLoop,
@@ -127,6 +128,8 @@ export function createLcmExpandTool(input: {
   /** Runtime session key (used for delegated expansion auth scoping). */
   sessionId?: string;
   sessionKey?: string;
+  senderId?: string;
+  getSessionUserIds?: () => Map<string, string> | undefined;
 }): AnyAgentTool {
   return {
     name: "lcm_expand",
@@ -189,10 +192,27 @@ export function createLcmExpandTool(input: {
         sessionKey: input.sessionKey,
         params: p,
       });
+      let visibilityAllowedConversationIds = delegatedGrant?.allowedConversationIds;
+      if (!visibilityAllowedConversationIds) {
+        const visibilityScope = await resolveVisibilityScopedConversations({
+          lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: p,
+          senderId: input.senderId,
+          getSessionUserIds: input.getSessionUserIds,
+        });
+        if (visibilityScope.error) {
+          return jsonResult({ error: visibilityScope.error });
+        }
+        visibilityAllowedConversationIds = visibilityScope.allowedConversationIds;
+      }
 
       const runExpand = async (input: {
         summaryIds: string[];
         conversationId: number;
+        allowedConversationIds?: number[];
         maxDepth?: number;
         tokenCap?: number;
         includeMessages?: boolean;
@@ -212,43 +232,16 @@ export function createLcmExpandTool(input: {
       if (query) {
         try {
           if (resolvedConversationId == null) {
-            const result = await orchestrator.describeAndExpand({
-              query,
-              mode: "full_text",
-              conversationId: undefined,
-              maxDepth,
-              tokenCap,
+            return jsonResult({
+              error: "Delegated expansion requires a single resolved conversation scope.",
             });
-            const text = distillForSubagent(result);
-            const policy = decideLcmExpansionRouting({
-              intent: "query_probe",
-              query,
-              requestedMaxDepth: maxDepth,
-              candidateSummaryCount: result.expansions.length,
-              tokenCap: tokenCap ?? Number.MAX_SAFE_INTEGER,
-              includeMessages: false,
-            });
-            return {
-              content: [{ type: "text", text }],
-              details: {
-                expansionCount: result.expansions.length,
-                citedIds: result.citedIds,
-                totalTokens: result.totalTokens,
-                truncated: result.truncated,
-                policy,
-                executionPath: "direct",
-                observability: buildOrchestrationObservability({
-                  policy,
-                  executionPath: "direct",
-                }),
-              },
-            };
           }
           const grepResult = await retrieval.grep({
             query,
             mode: "full_text",
             scope: "summaries",
             conversationId: resolvedConversationId,
+            allowedConversationIds: visibilityAllowedConversationIds,
           });
           const matchedSummaryIds = grepResult.summaries.map((entry) => entry.summaryId);
           const policy = decideLcmExpansionRouting({
@@ -307,6 +300,7 @@ export function createLcmExpandTool(input: {
                   tokenCap,
                   includeMessages: false,
                   conversationId: resolvedConversationId,
+                  allowedConversationIds: visibilityAllowedConversationIds,
                 });
           const text = distillForSubagent(result);
           return {
@@ -344,7 +338,7 @@ export function createLcmExpandTool(input: {
           if (conversationScope.conversationId != null) {
             const outOfScope: string[] = [];
             for (const summaryId of summaryIds) {
-              const described = await retrieval.describe(summaryId);
+              const described = await retrieval.describe(summaryId, [conversationScope.conversationId]);
               if (
                 described?.type === "summary" &&
                 described.summary?.conversationId !== conversationScope.conversationId
@@ -407,12 +401,18 @@ export function createLcmExpandTool(input: {
             };
           }
           const executionPath = delegated ? "direct_fallback" : "direct";
+          if (resolvedConversationId == null) {
+            return jsonResult({
+              error: "Expansion requires a single resolved conversation scope.",
+            });
+          }
           const result = await runExpand({
             summaryIds: normalizedSummaryIds,
             maxDepth,
             tokenCap,
             includeMessages,
-            conversationId: resolvedConversationId ?? 0,
+            conversationId: resolvedConversationId,
+            allowedConversationIds: visibilityAllowedConversationIds,
           });
           const text = distillForSubagent(result);
           return {

@@ -446,6 +446,59 @@ Default:
 
 - `max(leafChunkTokens, floor(leafChunkTokens * 2))`
 
+## Multi-session visibility and root indices
+
+### `visibility`
+
+Controls which sessions can read memory from other sessions.
+
+Defaults:
+
+- `enabled: false`
+- `rules: []`
+- `defaultPolicy: "owner-only"`
+- `userIdSource: "sender-id"`
+- `channelMembers: undefined`
+
+Why it matters:
+
+- when enabled, cross-session tools and root-index generation must filter every target conversation by the current visibility audience
+- DMs are owner-only under the default policy
+- Discord channel and thread sessions require membership data unless an explicit rule grants access
+- `channelMembers` is a manual fallback map where `null` means open channel, `[]` means restricted with no known members, and `["user-id"]` restricts to listed users
+
+### `rootSummary`
+
+Legacy config key for visibility-scoped root indices. The per-session root summary is still a normal summary DAG node; this config controls the cross-session index injected into visible sessions.
+
+Defaults:
+
+- `enabled: false`
+- `maxTokens: 2000`
+- `scope: "user"`
+- `minAgeMinutes: 0`
+- `customInstructions: ""`
+
+Why it matters:
+
+- each visible scope receives a compact index of visible sessions organized by channel/thread plus session keywords
+- root indices are stale-marked when underlying visible summaries change and are regenerated on demand or during maintenance
+- `rootSummary.enabled` should be paired with `visibility.enabled`
+
+### `nightlyCompaction`
+
+Controls the built-in background maintenance sweep.
+
+Defaults:
+
+- `enabled: false`
+- `hour: 4`
+- `forceFreshTail: false`
+
+Why it matters:
+
+- nightly maintenance can compact quiet conversations, create session abstracts, refresh root-index keywords, and regenerate stale root indices
+
 ## Summary quality and prompt controls
 
 ### `summaryMaxOverageFactor`

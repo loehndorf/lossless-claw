@@ -74,6 +74,8 @@ export interface GrepInput {
    *  "relevance" sorts by FTS5 BM25 rank (full_text mode only).
    *  "hybrid" blends relevance with recency. */
   sort?: SearchSort;
+  allowedConversationIds?: number[];
+  includeDeletedScopes?: boolean;
 }
 
 export interface GrepResult {
@@ -90,6 +92,10 @@ export interface ExpandInput {
   includeMessages?: boolean;
   /** Max tokens to return before truncating */
   tokenCap?: number;
+  /** Restrict expansion to this conversation. */
+  conversationId?: number;
+  /** Restrict expansion to this set of conversations. Empty means no access. */
+  allowedConversationIds?: number[];
 }
 
 export interface ExpandResult {
@@ -133,29 +139,44 @@ export class RetrievalEngine {
    * - IDs starting with "file_" are looked up as large files.
    * - Returns null if the item is not found.
    */
-  async describe(id: string): Promise<DescribeResult | null> {
+  async describe(id: string, allowedConversationIds?: number[]): Promise<DescribeResult | null> {
     if (id.startsWith("sum_")) {
-      return this.describeSummary(id);
+      return this.describeSummary(id, allowedConversationIds);
     }
     if (id.startsWith("file_")) {
-      return this.describeFile(id);
+      return this.describeFile(id, allowedConversationIds);
     }
     return null;
   }
 
-  private async describeSummary(id: string): Promise<DescribeResult | null> {
+  private isConversationAllowed(
+    conversationId: number | null | undefined,
+    allowedConversationIds?: number[],
+  ): boolean {
+    if (typeof conversationId !== "number") {
+      return false;
+    }
+    if (!allowedConversationIds) {
+      return true;
+    }
+    return allowedConversationIds.includes(conversationId);
+  }
+
+  private async describeSummary(id: string, allowedConversationIds?: number[]): Promise<DescribeResult | null> {
     const summary = await this.summaryStore.getSummary(id);
-    if (!summary) {
+    if (!summary || !this.isConversationAllowed(summary.conversationId, allowedConversationIds)) {
       return null;
     }
 
     // Fetch lineage in parallel
-    const [parents, children, messageIds, subtree] = await Promise.all([
+    const [rawParents, rawChildren, messageIds, subtree] = await Promise.all([
       this.summaryStore.getSummaryParents(id),
       this.summaryStore.getSummaryChildren(id),
       this.summaryStore.getSummaryMessages(id),
       this.summaryStore.getSummarySubtree(id),
     ]);
+    const parents = rawParents.filter((p) => this.isConversationAllowed(p.conversationId, allowedConversationIds));
+    const children = rawChildren.filter((c) => this.isConversationAllowed(c.conversationId, allowedConversationIds));
 
     return {
       id,
@@ -175,29 +196,31 @@ export class RetrievalEngine {
         messageIds,
         earliestAt: summary.earliestAt,
         latestAt: summary.latestAt,
-        subtree: subtree.map((node) => ({
-          summaryId: node.summaryId,
-          parentSummaryId: node.parentSummaryId,
-          depthFromRoot: node.depthFromRoot,
-          kind: node.kind,
-          depth: node.depth,
-          tokenCount: node.tokenCount,
-          descendantCount: node.descendantCount,
-          descendantTokenCount: node.descendantTokenCount,
-          sourceMessageTokenCount: node.sourceMessageTokenCount,
-          earliestAt: node.earliestAt,
-          latestAt: node.latestAt,
-          childCount: node.childCount,
-          path: node.path,
-        })),
+        subtree: subtree
+          .filter((node) => this.isConversationAllowed(node.conversationId, allowedConversationIds))
+          .map((node) => ({
+            summaryId: node.summaryId,
+            parentSummaryId: node.parentSummaryId,
+            depthFromRoot: node.depthFromRoot,
+            kind: node.kind,
+            depth: node.depth,
+            tokenCount: node.tokenCount,
+            descendantCount: node.descendantCount,
+            descendantTokenCount: node.descendantTokenCount,
+            sourceMessageTokenCount: node.sourceMessageTokenCount,
+            earliestAt: node.earliestAt,
+            latestAt: node.latestAt,
+            childCount: node.childCount,
+            path: node.path,
+          })),
         createdAt: summary.createdAt,
       },
     };
   }
 
-  private async describeFile(id: string): Promise<DescribeResult | null> {
+  private async describeFile(id: string, allowedConversationIds?: number[]): Promise<DescribeResult | null> {
     const file = await this.summaryStore.getLargeFile(id);
-    if (!file) {
+    if (!file || !this.isConversationAllowed(file.conversationId, allowedConversationIds)) {
       return null;
     }
 
@@ -224,9 +247,9 @@ export class RetrievalEngine {
    * Depending on `scope`, searches messages, summaries, or both (in parallel).
    */
   async grep(input: GrepInput): Promise<GrepResult> {
-    const { query, mode, scope, conversationId, since, before, limit, sort } = input;
+    const { query, mode, scope, conversationId, since, before, limit, sort, allowedConversationIds, includeDeletedScopes } = input;
 
-    const searchInput = { query, mode, conversationId, since, before, limit, sort };
+    const searchInput = { query, mode, conversationId, since, before, limit, sort, allowedConversationIds, includeDeletedScopes };
 
     let messages: MessageSearchResult[] = [];
     let summaries: SummarySearchResult[] = [];
@@ -271,7 +294,10 @@ export class RetrievalEngine {
       truncated: false,
     };
 
-    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result);
+    const allowedConversationIds = input.allowedConversationIds ??
+      (typeof input.conversationId === "number" ? [input.conversationId] : undefined);
+
+    await this.expandRecursive(input.summaryId, depth, includeMessages, tokenCap, result, allowedConversationIds);
 
     return result;
   }
@@ -282,6 +308,7 @@ export class RetrievalEngine {
     includeMessages: boolean,
     tokenCap: number,
     result: ExpandResult,
+    allowedConversationIds?: number[],
   ): Promise<void> {
     if (depth <= 0) {
       return;
@@ -291,7 +318,7 @@ export class RetrievalEngine {
     }
 
     const summary = await this.summaryStore.getSummary(summaryId);
-    if (!summary) {
+    if (!summary || !this.isConversationAllowed(summary.conversationId, allowedConversationIds)) {
       return;
     }
 
@@ -305,6 +332,10 @@ export class RetrievalEngine {
       for (const child of children) {
         if (result.truncated) {
           break;
+        }
+
+        if (!this.isConversationAllowed(child.conversationId, allowedConversationIds)) {
+          continue;
         }
 
         // Check if adding this child would exceed the token cap
@@ -323,7 +354,7 @@ export class RetrievalEngine {
 
         // Recurse into children if depth allows
         if (depth > 1) {
-          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result);
+          await this.expandRecursive(child.summaryId, depth - 1, includeMessages, tokenCap, result, allowedConversationIds);
         }
       }
     } else if (summary.kind === "leaf" && includeMessages) {
@@ -336,7 +367,7 @@ export class RetrievalEngine {
         }
 
         const msg = await this.conversationStore.getMessageById(msgId);
-        if (!msg) {
+        if (!msg || !this.isConversationAllowed(msg.conversationId, allowedConversationIds)) {
           continue;
         }
 

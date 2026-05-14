@@ -681,6 +681,8 @@ describe("ExpansionOrchestrator", () => {
       depth: 5,
       includeMessages: true,
       tokenCap: 3000,
+      conversationId: 1,
+      allowedConversationIds: undefined,
     });
   });
 

@@ -42,6 +42,54 @@ export type LcmConfigDiagnostics = {
   statelessSessionPatternsEnvOverridesPluginConfig: boolean;
 };
 
+export type VisibilityConfig = {
+  /** Enable visibility filtering for cross-conversation LCM access. */
+  enabled: boolean;
+  /** Path to a JSON file with visibility rules. */
+  rulesFile?: string;
+  /** Inline visibility rules. */
+  rules: Array<{
+    sessionPattern: string;
+    allowedUsers: string[];
+    label?: string;
+  }>;
+  /** Default policy when no rule matches. */
+  defaultPolicy: "owner-only" | "open";
+  /**
+   * How to determine the current user for visibility checks.
+   * "session-key" = extract from the current session key (DM user ID)
+   * "sender-id" = use the sender_id from inbound message metadata
+   */
+  userIdSource: "session-key" | "sender-id";
+  /**
+   * Map of channel_id → members.
+   * null means open to every guild member; [] means restricted with no known members.
+   */
+  channelMembers?: Record<string, string[] | null>;
+};
+
+export type RootSummaryConfig = {
+  /** Enable visibility-scoped cross-session root indices (legacy key name). */
+  enabled: boolean;
+  /** Approximate maximum token budget for each root index. */
+  maxTokens: number;
+  /** Root-index visibility scope. Currently per visible user/scope. */
+  scope: "user";
+  /** Minimum age before background regeneration should eagerly rebuild roots. */
+  minAgeMinutes: number;
+  /** Optional custom instructions for future model-backed root-index summarization. */
+  customInstructions: string;
+};
+
+export type NightlyCompactionConfig = {
+  /** Enable the built-in background nightly compaction sweep. */
+  enabled: boolean;
+  /** Hour (0–23 local time) at which the nightly compaction scheduler runs. */
+  hour: number;
+  /** When true, forced nightly compaction may summarize the protected fresh tail. */
+  forceFreshTail: boolean;
+};
+
 export type LcmConfig = {
   enabled: boolean;
   databasePath: string;
@@ -111,6 +159,15 @@ export type LcmConfig = {
   cacheAwareCompaction: CacheAwareCompactionConfig;
   /** Dynamic step-band policy for incremental leaf chunk sizing. */
   dynamicLeafChunkTokens: DynamicLeafChunkTokensConfig;
+  /** Visibility filtering for cross-conversation access. */
+  visibility: VisibilityConfig;
+  /** Root-index configuration for cross-session awareness (legacy key name). */
+  rootSummary: RootSummaryConfig;
+  /** Built-in background nightly compaction sweep. */
+  nightlyCompaction: NightlyCompactionConfig;
+  /** Deprecated alias for nightlyCompaction.hour. */
+  nightlyCompactHour: number;
+  /** Backfill configuration for importing historical messages. */
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -198,6 +255,47 @@ function toProactiveThresholdCompactionMode(
   return undefined;
 }
 
+/** Parse visibility rules from plugin config array. */
+function parseVisibilityRules(value: unknown): Array<{
+  sessionPattern: string;
+  allowedUsers: string[];
+  label?: string;
+}> {
+  if (!Array.isArray(value)) return [];
+  const rules: Array<{ sessionPattern: string; allowedUsers: string[]; label?: string }> = [];
+  for (const item of value) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      const sessionPattern = toStr(rec.sessionPattern);
+      if (!sessionPattern) continue;
+      const allowedUsers = Array.isArray(rec.allowedUsers)
+        ? rec.allowedUsers.filter((u): u is string => typeof u === "string")
+        : [];
+      const label = toStr(rec.label);
+      rules.push({ sessionPattern, allowedUsers, ...(label ? { label } : {}) });
+    }
+  }
+  return rules;
+}
+
+/** Parse channelMembers from plugin config: { channelId: [userId, ...] | null } */
+function parseChannelMembers(value: unknown): Record<string, string[] | null> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result: Record<string, string[] | null> = {};
+  const rec = value as Record<string, unknown>;
+  for (const [key, val] of Object.entries(rec)) {
+    if (val === null) {
+      result[key] = null;
+      continue;
+    }
+    if (Array.isArray(val)) {
+      const users = val.filter((u): u is string => typeof u === "string");
+      result[key] = users;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /** Coerce a plugin config value into a trimmed string array when possible. */
 function toStrArray(value: unknown): string[] | undefined {
   if (Array.isArray(value)) {
@@ -283,6 +381,8 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
+  const rootSummary = toRecord(pc.rootSummary);
+  const nightlyCompaction = toRecord(pc.nightlyCompaction);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
@@ -324,6 +424,17 @@ export function resolveLcmConfigWithDiagnostics(
       parseFiniteNumber(env.LCM_COLD_CACHE_OBSERVATION_THRESHOLD)
         ?? toNumber(cacheAwareCompaction?.coldCacheObservationThreshold)
         ?? 3,
+    ),
+  );
+  const resolvedNightlyCompactionHour = Math.min(
+    23,
+    Math.max(
+      0,
+      parseFiniteInt(env.LCM_NIGHTLY_COMPACTION_HOUR)
+        ?? parseFiniteInt(env.LCM_NIGHTLY_COMPACT_HOUR)
+        ?? toNumber(nightlyCompaction?.hour)
+        ?? toNumber(pc.nightlyCompactHour)
+        ?? 4,
     ),
   );
 
@@ -468,6 +579,56 @@ export function resolveLcmConfigWithDiagnostics(
             : toBool(dynamicLeafChunkTokens?.enabled) ?? true,
         max: resolvedDynamicLeafChunkMax,
       },
+      visibility: {
+        enabled:
+          env.LCM_VISIBILITY_ENABLED !== undefined
+            ? env.LCM_VISIBILITY_ENABLED === "true"
+            : toBool(toRecord(pc.visibility)?.enabled) ?? false,
+        rulesFile: toStr(toRecord(pc.visibility)?.rulesFile),
+        rules: parseVisibilityRules(toRecord(pc.visibility)?.rules),
+        defaultPolicy:
+          toStr(toRecord(pc.visibility)?.defaultPolicy) === "open" ? "open" : "owner-only",
+        userIdSource:
+          toStr(toRecord(pc.visibility)?.userIdSource) === "session-key" ? "session-key" : "sender-id",
+        channelMembers: parseChannelMembers(toRecord(pc.visibility)?.channelMembers),
+      },
+      rootSummary: {
+        enabled:
+          env.LCM_ROOT_SUMMARY_ENABLED !== undefined
+            ? env.LCM_ROOT_SUMMARY_ENABLED === "true"
+            : toBool(rootSummary?.enabled) ?? false,
+        maxTokens:
+          Math.max(
+            1,
+            parseFiniteInt(env.LCM_ROOT_SUMMARY_MAX_TOKENS)
+              ?? toNumber(rootSummary?.maxTokens)
+              ?? 2000,
+          ),
+        scope: "user",
+        minAgeMinutes:
+          Math.max(
+            0,
+            parseFiniteNumber(env.LCM_ROOT_SUMMARY_MIN_AGE_MINUTES)
+              ?? toNumber(rootSummary?.minAgeMinutes)
+              ?? 0,
+          ),
+        customInstructions:
+          env.LCM_ROOT_SUMMARY_CUSTOM_INSTRUCTIONS?.trim()
+            ?? toStr(rootSummary?.customInstructions)
+            ?? "",
+      },
+      nightlyCompaction: {
+        enabled:
+          env.LCM_NIGHTLY_COMPACTION_ENABLED !== undefined
+            ? env.LCM_NIGHTLY_COMPACTION_ENABLED !== "false"
+            : toBool(nightlyCompaction?.enabled) ?? false,
+        hour: resolvedNightlyCompactionHour,
+        forceFreshTail:
+          env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL !== undefined
+            ? env.LCM_NIGHTLY_COMPACTION_FORCE_FRESH_TAIL === "true"
+            : toBool(nightlyCompaction?.forceFreshTail) ?? false,
+      },
+      nightlyCompactHour: resolvedNightlyCompactionHour,
     },
     diagnostics: {
       ignoreSessionPatternsSource: ignoreSessionPatterns.source,

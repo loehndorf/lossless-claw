@@ -70,6 +70,7 @@ export type SummarySearchInput = {
   before?: Date;
   limit?: number;
   sort?: SearchSort;
+  allowedConversationIds?: number[];
 };
 
 export type SummarySearchResult = {
@@ -1017,6 +1018,16 @@ export class SummaryStore {
   // ── Search ────────────────────────────────────────────────────────────────
 
   async searchSummaries(input: SummarySearchInput): Promise<SummarySearchResult[]> {
+    if (input.allowedConversationIds && input.allowedConversationIds.length === 0) {
+      return [];
+    }
+    if (
+      input.allowedConversationIds &&
+      input.conversationId != null &&
+      !input.allowedConversationIds.includes(input.conversationId)
+    ) {
+      return [];
+    }
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
@@ -1036,6 +1047,7 @@ export class SummaryStore {
               input.since,
               input.before,
               input.sort,
+              input.allowedConversationIds,
             );
             if (trigramResults.length > 0) {
               return trigramResults;
@@ -1050,6 +1062,7 @@ export class SummaryStore {
           input.conversationId,
           input.since,
           input.before,
+          input.allowedConversationIds,
         );
       }
       if (this.fts5Available) {
@@ -1061,6 +1074,7 @@ export class SummaryStore {
             input.since,
             input.before,
             input.sort,
+            input.allowedConversationIds,
           );
         } catch {
           return this.searchLike(
@@ -1069,12 +1083,13 @@ export class SummaryStore {
             input.conversationId,
             input.since,
             input.before,
+            input.allowedConversationIds,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before, input.allowedConversationIds);
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before, input.allowedConversationIds);
   }
 
   private searchFullText(
@@ -1084,12 +1099,16 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
     sort?: SearchSort,
+    allowedConversationIds?: number[],
   ): SummarySearchResult[] {
     const where: string[] = ["summaries_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
     if (conversationId != null) {
       where.push("s.conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`s.conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
@@ -1124,6 +1143,7 @@ export class SummaryStore {
     conversationId?: number,
     since?: Date,
     before?: Date,
+    allowedConversationIds?: number[],
   ): SummarySearchResult[] {
     const plan = buildLikeSearchPlan("content", query);
     if (plan.terms.length === 0) {
@@ -1135,6 +1155,9 @@ export class SummaryStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
@@ -1212,6 +1235,7 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
     sort?: SearchSort,
+    allowedConversationIds?: number[],
   ): SummarySearchResult[] {
     const cjkSegments = this.extractCjkSegments(query).filter((segment) => segment.length >= 3);
     if (cjkSegments.length === 0) {
@@ -1240,6 +1264,9 @@ export class SummaryStore {
     if (conversationId != null) {
       where.push("s.conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`s.conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR}) >= julianday(?)`);
@@ -1280,6 +1307,7 @@ export class SummaryStore {
     conversationId?: number,
     since?: Date,
     before?: Date,
+    allowedConversationIds?: number[],
   ): SummarySearchResult[] {
     const cjkSegments = this.extractCjkSegments(query);
     const latinTokens = this.extractLatinTokens(query);
@@ -1315,6 +1343,9 @@ export class SummaryStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);
@@ -1356,6 +1387,7 @@ export class SummaryStore {
     conversationId?: number,
     since?: Date,
     before?: Date,
+    allowedConversationIds?: number[],
   ): SummarySearchResult[] {
     // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
     if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
@@ -1373,6 +1405,9 @@ export class SummaryStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push(`julianday(${SUMMARY_SEARCH_TIME_EXPR_UNQUALIFIED}) >= julianday(?)`);

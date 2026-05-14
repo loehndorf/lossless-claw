@@ -792,7 +792,7 @@ func openLCMDB(path string) (*sql.DB, error) {
 	}
 	// WAL mode + generous busy_timeout for concurrent access with gateway.
 	db.Exec("PRAGMA journal_mode=WAL")
-	db.Exec("PRAGMA busy_timeout=10000")
+	db.Exec("PRAGMA busy_timeout=60000")
 	return db, nil
 }
 

@@ -7,12 +7,13 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
+import { startNightlyCompactionScheduler } from "../nightly-compaction.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
 import type { SharedLcmInit } from "./shared-init.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
@@ -639,9 +640,32 @@ function inferApiFromProvider(provider: string): string | undefined {
     "google-antigravity": "google-gemini-cli",
     "google-vertex": "google-vertex",
     "amazon-bedrock": "bedrock-converse-stream",
+    openrouter: "openai-completions",
+    fireworks: "openai-completions",
+    together: "openai-completions",
+    groq: "openai-completions",
+    deepseek: "openai-completions",
     ollama: "openai-completions",
   };
   return map[normalized];
+}
+
+function inferBaseUrlFromProvider(provider: string): string | undefined {
+  const normalized = normalizeProviderId(provider);
+  const map: Record<string, string> = {
+    openrouter: "https://openrouter.ai/api/v1",
+    fireworks: "https://api.fireworks.ai/inference/v1",
+    together: "https://api.together.xyz/v1",
+    groq: "https://api.groq.com/openai/v1",
+    deepseek: "https://api.deepseek.com/v1",
+    openai: "https://api.openai.com/v1",
+    anthropic: "https://api.anthropic.com/v1",
+  };
+  return map[normalized];
+}
+
+function isHttpUrl(value: string | undefined): boolean {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
 }
 
 /** Codex Responses rejects `temperature`; omit it for that API family. */
@@ -740,6 +764,45 @@ function resolveProviderApiFromRuntimeConfig(
   }
   const api = value.api;
   return typeof api === "string" && api.trim() ? api.trim() : undefined;
+}
+
+/**
+ * Resolve the api family for a specific model from runtime config.
+ *
+ * Walks `models.providers.<provider>.models[]` looking for a matching id and
+ * returns its `api` field if declared. Lets users override the api per model
+ * (e.g. when a single provider name maps to differently-shaped endpoints).
+ */
+export function resolveModelApiFromRuntimeConfig(
+  runtimeConfig: unknown,
+  provider: string,
+  model: string,
+): string | undefined {
+  if (!isRecord(runtimeConfig)) {
+    return undefined;
+  }
+  const providers = (runtimeConfig as { models?: { providers?: Record<string, unknown> } }).models
+    ?.providers;
+  if (!providers || !isRecord(providers)) {
+    return undefined;
+  }
+  const value = findProviderConfigValue(providers, provider);
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const models = value.models;
+  if (!Array.isArray(models)) {
+    return undefined;
+  }
+  const target = model.trim();
+  for (const entry of models) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry.id !== "string") continue;
+    if (entry.id.trim() !== target) continue;
+    const api = entry.api;
+    return typeof api === "string" && api.trim() ? api.trim() : undefined;
+  }
+  return undefined;
 }
 
 /** Resolve runtime.modelAuth from plugin runtime when available. */
@@ -1535,12 +1598,29 @@ function createLcmDependencies(
 
         const knownModel =
           typeof mod.getModel === "function" ? mod.getModel(providerId, modelId) : undefined;
-        const fallbackApi =
-          (isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
+        const providerApiHint = providerApi?.trim();
+        // Historical LCM callers used `providerApi` for two different things:
+        // - pi-ai API family (e.g. "openai-completions")
+        // - provider base URL (e.g. "https://openrouter.ai/api/v1")
+        // Keep both paths working by splitting URL hints from API-family hints.
+        const providerBaseUrlHint = isHttpUrl(providerApiHint) ? providerApiHint : undefined;
+        const providerApiFamilyHint = providerApiHint && !providerBaseUrlHint ? providerApiHint : undefined;
+        const modelRuntimeApi = resolveModelApiFromRuntimeConfig(
+          effectiveRuntimeConfig,
+          providerId,
+          modelId,
+        );
+        const providerRuntimeApi =
+          providerApiFamilyHint ||
+          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId);
+        const knownModelApi =
+          isRecord(knownModel) && typeof knownModel.api === "string" && knownModel.api.trim()
             ? knownModel.api.trim()
-            : undefined) ||
-          providerApi?.trim() ||
-          resolveProviderApiFromRuntimeConfig(effectiveRuntimeConfig, providerId) ||
+            : undefined;
+        const fallbackApi =
+          modelRuntimeApi ||
+          providerRuntimeApi ||
+          knownModelApi ||
           (() => {
             if (typeof mod.getModels !== "function") {
               return undefined;
@@ -1584,10 +1664,7 @@ function createLcmDependencies(
                 ...knownModel,
                 id: knownModel.id,
                 provider: knownModel.provider,
-                api:
-                  typeof providerLevelConfig.api === "string" && providerLevelConfig.api.trim()
-                    ? providerLevelConfig.api.trim()
-                    : knownModel.api,
+                api: modelRuntimeApi || providerRuntimeApi || knownModel.api,
                 // Provider config must be able to override built-in transport defaults.
                 // Otherwise built-in providers like `openai` keep their catalog baseUrl
                 // (`https://api.openai.com/v1`) even when OpenClaw runtime config points
@@ -1595,11 +1672,12 @@ function createLcmDependencies(
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
                 baseUrl:
-                  typeof providerLevelConfig.baseUrl === "string"
+                  providerBaseUrlHint ||
+                  (typeof providerLevelConfig.baseUrl === "string"
                     ? providerLevelConfig.baseUrl
                     : typeof knownModel.baseUrl === "string"
                       ? knownModel.baseUrl
-                      : "",
+                      : inferBaseUrlFromProvider(providerId) ?? ""),
                 ...(isRecord(providerLevelConfig.headers)
                   ? {
                       headers: {
@@ -1626,9 +1704,11 @@ function createLcmDependencies(
                 maxTokens: 8_000,
                 // Always set baseUrl to a string — pi-ai's detectCompat() crashes when
                 // baseUrl is undefined.
-                baseUrl: typeof providerLevelConfig.baseUrl === "string"
-                  ? providerLevelConfig.baseUrl
-                  : "",
+                baseUrl:
+                  providerBaseUrlHint ||
+                  (typeof providerLevelConfig.baseUrl === "string"
+                    ? providerLevelConfig.baseUrl
+                    : inferBaseUrlFromProvider(providerId) ?? ""),
                 ...(isRecord(providerLevelConfig.headers)
                   ? { headers: providerLevelConfig.headers }
                   : {}),
@@ -1989,20 +2069,23 @@ function wirePluginHandlers(
   api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool((ctx) =>
-    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    createLcmGrepTool({ deps, getLcm: shared.waitForEngine, sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, senderId: ctx.requesterSenderId, getSessionUserIds: () => shared.getCachedEngine()?.getSessionUserIds() }),
   );
   api.registerTool((ctx) =>
-    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    createLcmDescribeTool({ deps, getLcm: shared.waitForEngine, sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, senderId: ctx.requesterSenderId, getSessionUserIds: () => shared.getCachedEngine()?.getSessionUserIds() }),
   );
   api.registerTool((ctx) =>
-    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionKey: ctx.sessionKey }),
+    createLcmExpandTool({ deps, getLcm: shared.waitForEngine, sessionId: ctx.sessionId, sessionKey: ctx.sessionKey, senderId: ctx.requesterSenderId }),
   );
   api.registerTool((ctx) =>
     createLcmExpandQueryTool({
       deps,
       getLcm: shared.waitForEngine,
+      sessionId: ctx.sessionId,
       sessionKey: ctx.sessionKey,
       requesterSessionKey: ctx.sessionKey,
+      senderId: ctx.requesterSenderId,
+      getSessionUserIds: () => shared.getCachedEngine()?.getSessionUserIds(),
     }),
   );
 
@@ -2234,6 +2317,24 @@ const lcmPlugin = {
         message: `[lcm] Fallback providers: ${deps.config.fallbackProviders.map((fp) => `${fp.provider}/${fp.model}`).join(", ")}`,
       });
     }
+
+    let nightlyCompactionScheduler: ReturnType<typeof startNightlyCompactionScheduler> | null = null;
+    api.on("gateway_start", () => {
+      nightlyCompactionScheduler?.stop();
+      nightlyCompactionScheduler = startNightlyCompactionScheduler({
+        enabled: deps.config.nightlyCompaction.enabled,
+        hour: deps.config.nightlyCompaction.hour,
+        waitForEngine,
+        config: deps.config,
+        log: deps.log,
+        isStopped: () => stopped,
+      });
+    });
+
+    api.on("gateway_stop", async () => {
+      nightlyCompactionScheduler?.stop();
+      nightlyCompactionScheduler = null;
+    });
   },
 };
 

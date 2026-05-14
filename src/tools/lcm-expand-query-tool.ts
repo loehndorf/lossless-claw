@@ -12,6 +12,7 @@ import {
   normalizeSummaryIds,
   resolveRequesterConversationScopeId,
 } from "./lcm-expand-tool.delegation.js";
+import { resolveVisibilityScopedConversations } from "./lcm-visibility-scope.js";
 import {
   acquireExpansionConcurrencySlot,
   clearDelegatedExpansionContext,
@@ -300,7 +301,7 @@ function buildDelegatedExpandQueryTask(params: {
     `- Keep answer concise and focused (target <= ${params.maxTokens} tokens).`,
     "- citedIds must be unique summary IDs.",
     "- expandedSummaryCount should reflect how many summaries were expanded/used.",
-    "- totalSourceTokens should estimate total tokens consumed from expansion calls.",
+    "- totalSourceTokens should estimate the total source tokens consumed for retrieval. Include both: (a) the `totalTokens` returned by each `lcm_expand` call you made, AND (b) for any explicit leaf summary used as evidence, the leaf summary's own `tok` value from `lcm_describe`, even if you did not call `lcm_expand` for that leaf. This avoids reporting `totalSourceTokens: 0` when the answer was actually derived from a leaf summary's content.",
     "- truncated should indicate whether source expansion appears truncated.",
   ]
     .filter((line): line is string => typeof line === "string")
@@ -632,12 +633,13 @@ async function resolveSummaryCandidates(params: {
   explicitSummaryIds: string[];
   query?: string;
   conversationId?: number;
+  allowedConversationIds?: number[];
 }): Promise<SummaryCandidate[]> {
   const retrieval = params.lcm.getRetrieval();
   const candidates = new Map<string, SummaryCandidate>();
 
   for (const summaryId of params.explicitSummaryIds) {
-    const described = await retrieval.describe(summaryId);
+    const described = await retrieval.describe(summaryId, params.allowedConversationIds);
     if (!described || described.type !== "summary" || !described.summary) {
       throw new Error(`Summary not found: ${summaryId}`);
     }
@@ -657,6 +659,7 @@ async function resolveSummaryCandidates(params: {
       mode: "full_text",
       scope: "summaries",
       conversationId: params.conversationId,
+      allowedConversationIds: params.allowedConversationIds,
     });
     for (const summary of grepResult.summaries) {
       upsertSummaryCandidate(candidates, {
@@ -676,6 +679,7 @@ async function resolveSummaryCandidates(params: {
           mode: "full_text",
           scope: "messages",
           conversationId: params.conversationId,
+          allowedConversationIds: params.allowedConversationIds,
         });
         const messageIds = messageResult.messages.map((message) => message.messageId);
         const leafLinks = await summaryStore.getLeafSummaryLinksForMessageIds(
@@ -889,6 +893,8 @@ export function createLcmExpandQueryTool(input: {
   requesterSessionKey?: string;
   /** Session key for scope fallback when sessionId is unavailable. */
   sessionKey?: string;
+  senderId?: string;
+  getSessionUserIds?: () => Map<string, string> | undefined;
 }): AnyAgentTool {
   const delegatedWaitTimeoutMs =
     input.deps.config.delegationTimeoutMs || DEFAULT_DELEGATED_WAIT_TIMEOUT_MS;
@@ -1006,11 +1012,33 @@ export function createLcmExpandQueryTool(input: {
           });
         }
 
+        const visibilityParams =
+          !conversationScope.allConversations && typeof scopedConversationId === "number"
+            ? { ...p, conversationId: scopedConversationId }
+            : p;
+        const visibilityScope = await resolveVisibilityScopedConversations({
+          lcm,
+          deps: input.deps,
+          sessionId: input.sessionId,
+          sessionKey: input.sessionKey,
+          params: visibilityParams,
+          senderId: input.senderId,
+          getSessionUserIds: input.getSessionUserIds,
+        });
+        if (visibilityScope.error) {
+          return jsonResult({ error: visibilityScope.error });
+        }
+        const allowedConversationIds = visibilityScope.allowedConversationIds ??
+          (!conversationScope.allConversations && typeof scopedConversationId === "number"
+            ? [scopedConversationId]
+            : undefined);
+
         const candidates = await resolveSummaryCandidates({
           lcm,
           explicitSummaryIds,
           query: query || undefined,
           conversationId: scopedConversationId,
+          allowedConversationIds,
         });
 
         if (candidates.length === 0) {

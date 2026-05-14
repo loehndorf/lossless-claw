@@ -188,6 +188,7 @@ const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 const EMBEDDED_DATA_URL_RE = /data:[^;\s"'`]+;base64,[A-Za-z0-9+/=\s]+/gi;
 const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
+const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = ["content", "parts", "items", "message", "messages"] as const;
 
@@ -281,6 +282,9 @@ function extractSanitizedStructuredText(value: unknown, depth = 0): string[] {
 
   const record = value as Record<string, unknown>;
   const rawType = typeof record.type === "string" ? record.type.trim().toLowerCase() : "";
+  if (PROVIDER_REASONING_RAW_TYPES.has(rawType)) {
+    return [];
+  }
   const textFragments: string[] = [];
 
   for (const key of STRUCTURED_MEDIA_TEXT_KEYS) {
@@ -1494,7 +1498,15 @@ export class CompactionEngine {
     }
 
     const concatenated = messageContents
-      .map((message) => `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${message.content}`)
+      .map((message) => {
+        // Strip provider reasoning/thinking blocks (e.g. {type:"thinking",thinkingSignature:"..."})
+        // so encrypted signatures and non-visible metadata don't pollute the summary.
+        // The raw message content is preserved in the DB for conversation history and prompt caching.
+        const text = extractMeaningfulMessageText(message.content);
+        if (!text) return null;
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
+      })
+      .filter((s): s is string => s !== null)
       .join("\n\n");
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),

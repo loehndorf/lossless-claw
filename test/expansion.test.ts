@@ -49,6 +49,19 @@ const BASE_CONFIG: LcmConfig = {
     enabled: true,
     max: 40_000,
   },
+  visibility: {
+    enabled: false,
+    rules: [],
+    defaultPolicy: "owner-only",
+    userIdSource: "sender-id",
+  },
+  rootSummary: {
+    enabled: false,
+    maxTokens: 2000,
+    scope: "user",
+    minAgeMinutes: 0,
+    customInstructions: "",
+  },
 };
 
 function makeExpansionResult() {

@@ -98,6 +98,7 @@ export type MessageSearchInput = {
   before?: Date;
   limit?: number;
   sort?: SearchSort;
+  allowedConversationIds?: ConversationId[];
 };
 
 export type MessageSearchResult = {
@@ -451,9 +452,12 @@ export class ConversationStore {
   // ── Message operations ────────────────────────────────────────────────────
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
+    const identityHash = input.identityHash ?? buildMessageIdentityHash(input.role, input.content);
+
+    // Use INSERT OR IGNORE to handle UNIQUE constraint violations gracefully
     const result = this.db
       .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
+        `INSERT OR IGNORE INTO messages (conversation_id, seq, role, content, token_count, identity_hash)
        VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(
@@ -462,9 +466,31 @@ export class ConversationStore {
         input.role,
         input.content,
         input.tokenCount,
-        input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+        identityHash,
       );
 
+    const changes = result.changes ?? 0;
+
+    // If INSERT OR IGNORE skipped the insert (duplicate), fetch the existing row
+    if (changes === 0) {
+      const existingRow = this.db
+        .prepare(
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+         FROM messages WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND content = ?
+         LIMIT 1`,
+        )
+        .get(input.conversationId, identityHash, input.role, input.content) as unknown as MessageRow | undefined;
+
+      if (existingRow) {
+        return toMessageRecord(existingRow);
+      }
+
+      throw new Error(
+        `createMessage failed: INSERT OR IGNORE returned no rowid for conversation=${input.conversationId} seq=${input.seq} role=${input.role}`,
+      );
+    }
+
+    // INSERT succeeded – read back the message using the auto-generated message_id
     const messageId = Number(result.lastInsertRowid);
 
     this.indexMessageForFullText(messageId, input.content);
@@ -474,9 +500,23 @@ export class ConversationStore {
         `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
        FROM messages WHERE message_id = ?`,
       )
-      .get(messageId) as unknown as MessageRow;
+      .get(messageId) as unknown as MessageRow | undefined;
 
-    return toMessageRecord(row);
+    if (row) {
+      return toMessageRecord(row);
+    }
+
+    // SELECT returned no row despite successful INSERT – return a synthetic record
+    // This can happen in WAL mode when the read snapshot lags behind the write
+    return {
+      messageId,
+      conversationId: input.conversationId,
+      seq: input.seq,
+      role: input.role,
+      content: input.content,
+      tokenCount: input.tokenCount,
+      createdAt: new Date(),
+    };
   }
 
   async createMessagesBulk(inputs: CreateMessageInput[]): Promise<MessageRecord[]> {
@@ -723,6 +763,16 @@ export class ConversationStore {
   // ── Search ────────────────────────────────────────────────────────────────
 
   async searchMessages(input: MessageSearchInput): Promise<MessageSearchResult[]> {
+    if (input.allowedConversationIds && input.allowedConversationIds.length === 0) {
+      return [];
+    }
+    if (
+      input.allowedConversationIds &&
+      input.conversationId != null &&
+      !input.allowedConversationIds.includes(input.conversationId)
+    ) {
+      return [];
+    }
     const limit = input.limit ?? 50;
 
     if (input.mode === "full_text") {
@@ -735,6 +785,7 @@ export class ConversationStore {
           input.conversationId,
           input.since,
           input.before,
+          input.allowedConversationIds,
         );
       }
       if (this.fts5Available) {
@@ -746,6 +797,7 @@ export class ConversationStore {
             input.since,
             input.before,
             input.sort,
+            input.allowedConversationIds,
           );
         } catch {
           return this.searchLike(
@@ -754,12 +806,13 @@ export class ConversationStore {
             input.conversationId,
             input.since,
             input.before,
+            input.allowedConversationIds,
           );
         }
       }
-      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before);
+      return this.searchLike(input.query, limit, input.conversationId, input.since, input.before, input.allowedConversationIds);
     }
-    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before);
+    return this.searchRegex(input.query, limit, input.conversationId, input.since, input.before, input.allowedConversationIds);
   }
 
   private indexMessageForFullText(messageId: MessageId, content: string): void {
@@ -797,12 +850,16 @@ export class ConversationStore {
     since?: Date,
     before?: Date,
     sort?: SearchSort,
+    allowedConversationIds?: ConversationId[],
   ): MessageSearchResult[] {
     const where: string[] = ["messages_fts MATCH ?"];
     const args: Array<string | number> = [sanitizeFts5Query(query)];
     if (conversationId != null) {
       where.push("m.conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`m.conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push("julianday(m.created_at) >= julianday(?)");
@@ -837,6 +894,7 @@ export class ConversationStore {
     conversationId?: ConversationId,
     since?: Date,
     before?: Date,
+    allowedConversationIds?: ConversationId[],
   ): MessageSearchResult[] {
     const plan = buildLikeSearchPlan("content", query);
     if (plan.terms.length === 0) {
@@ -848,6 +906,9 @@ export class ConversationStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");
@@ -871,7 +932,7 @@ export class ConversationStore {
       .all(...args) as unknown as MessageRow[];
 
     return rows
-      .map((row) => {
+      .map((row): MessageSearchResult | null => {
         const normalizedContent = normalizeMessageContentForFullTextIndex(row.content) ?? row.content;
         const haystack = normalizedContent.toLowerCase();
         const matchesAllTerms = plan.terms.every((term) => haystack.includes(term));
@@ -896,6 +957,7 @@ export class ConversationStore {
     conversationId?: ConversationId,
     since?: Date,
     before?: Date,
+    allowedConversationIds?: ConversationId[],
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
     // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
@@ -914,6 +976,9 @@ export class ConversationStore {
     if (conversationId != null) {
       where.push("conversation_id = ?");
       args.push(conversationId);
+    } else if (allowedConversationIds) {
+      where.push(`conversation_id IN (${allowedConversationIds.map(() => "?").join(",")})`);
+      args.push(...allowedConversationIds);
     }
     if (since) {
       where.push("julianday(created_at) >= julianday(?)");

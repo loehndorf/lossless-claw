@@ -15,6 +15,8 @@ export type ExpansionRequest = {
   includeMessages?: boolean;
   /** Conversation ID scope */
   conversationId: number;
+  /** Allowed conversation IDs for visibility-scoped expansion. */
+  allowedConversationIds?: number[];
 };
 
 export type ExpansionResult = {
@@ -144,6 +146,8 @@ export class ExpansionOrchestrator {
         depth: maxDepth,
         includeMessages,
         tokenCap: remainingBudget,
+        conversationId: request.conversationId,
+        allowedConversationIds: request.allowedConversationIds,
       });
 
       const entry = toExpansionEntry(summaryId, raw);
@@ -172,6 +176,7 @@ export class ExpansionOrchestrator {
     query: string;
     mode: "regex" | "full_text";
     conversationId?: number;
+    allowedConversationIds?: number[];
     maxDepth?: number;
     tokenCap?: number;
   }): Promise<ExpansionResult> {
@@ -180,6 +185,7 @@ export class ExpansionOrchestrator {
       mode: input.mode,
       scope: "summaries",
       conversationId: input.conversationId,
+      allowedConversationIds: input.allowedConversationIds,
     });
 
     const summaryIds = [...grepResult.summaries]
@@ -208,6 +214,7 @@ export class ExpansionOrchestrator {
       tokenCap: input.tokenCap,
       includeMessages: false,
       conversationId: input.conversationId ?? 0,
+      allowedConversationIds: input.allowedConversationIds,
     });
   }
 }

@@ -8,6 +8,7 @@ import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
 import { resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { resolveVisibilityScopedConversations } from "./lcm-visibility-scope.js";
 import { formatTimestamp } from "../compaction.js";
 
 function formatDisplayTime(
@@ -61,6 +62,8 @@ export function createLcmDescribeTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  senderId?: string;
+  getSessionUserIds?: () => Map<string, string> | undefined;
 }): AnyAgentTool {
   return {
     name: "lcm_describe",
@@ -93,8 +96,22 @@ export function createLcmDescribeTool(input: {
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
         });
       }
+      const visibilityScope = await resolveVisibilityScopedConversations({
+        lcm,
+        deps: input.deps,
+        sessionId: input.sessionId,
+        sessionKey: input.sessionKey,
+        params: p,
+        senderId: input.senderId,
+        getSessionUserIds: input.getSessionUserIds,
+      });
+      if (visibilityScope.error) {
+        return jsonResult({ error: visibilityScope.error });
+      }
+      const allowedConversationIds = visibilityScope.allowedConversationIds ??
+        (typeof conversationScope.conversationId === "number" ? [conversationScope.conversationId] : undefined);
 
-      const result = await retrieval.describe(id);
+      const result = await retrieval.describe(id, allowedConversationIds);
 
       if (!result) {
         return jsonResult({

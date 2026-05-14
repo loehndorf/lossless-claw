@@ -117,7 +117,12 @@ export async function resolveLcmConversationScope(input: {
   const conversation = await lookupConversationForSession({
     lcm,
     sessionId: normalizedSessionId,
-    sessionKey: input.sessionKey,
+    // We already tried the exact sessionKey above. If that failed but we can
+    // resolve the runtime session id, fall back by session id rather than
+    // passing the non-matching raw channel key again. This keeps current-thread
+    // tool calls working when OpenClaw's tool ctx only exposes the raw channel
+    // key while LCM stores the topic-enhanced key.
+    sessionKey: undefined,
   });
   if (!conversation) {
     return { conversationId: undefined, allConversations: false };

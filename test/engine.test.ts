@@ -216,6 +216,10 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
   } as AgentMessage;
 }
 
+async function flushImmediate(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 function corruptSessionFilePreservingObservedStats(sessionFile: string): void {
   const originalStats = statSync(sessionFile);
   writeFileSync(sessionFile, "x".repeat(originalStats.size));
@@ -1166,7 +1170,7 @@ describe("LcmContextEngine session_end lifecycle", () => {
     expect(active?.active).toBe(true);
   });
 
-  it("archives the prior active conversation and creates a fresh active row on idle rollover", async () => {
+  it("preserves the active conversation on idle runtime rollover", async () => {
     const engine = createEngine();
     (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
     const store = engine.getConversationStore();
@@ -1190,14 +1194,43 @@ describe("LcmContextEngine session_end lifecycle", () => {
     });
 
     const active = await store.getConversationBySessionKey("agent:main:main");
-    const archived = await store.getConversation(original.conversationId);
+    const preserved = await store.getConversation(original.conversationId);
 
     expect(active).not.toBeNull();
-    expect(active?.conversationId).not.toBe(original.conversationId);
-    expect(active?.sessionId).toBe("uuid-2");
+    expect(active?.conversationId).toBe(original.conversationId);
+    expect(active?.sessionId).toBe("uuid-1");
     expect(active?.active).toBe(true);
-    expect(archived?.active).toBe(false);
-    expect(archived?.archivedAt).not.toBeNull();
+    expect(preserved?.active).toBe(true);
+    expect(preserved?.archivedAt).toBeNull();
+  });
+
+  it("preserves the active conversation on daily runtime rollover", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+
+    const original = await store.getOrCreateConversation("uuid-1", {
+      sessionKey: "agent:main:main",
+    });
+    await store.createMessage({
+      conversationId: original.conversationId,
+      seq: 1,
+      role: "user",
+      content: "seed",
+      tokenCount: 5,
+    });
+
+    await engine.handleSessionEnd({
+      reason: "daily",
+      sessionId: "uuid-1",
+      sessionKey: "agent:main:main",
+      nextSessionId: "uuid-2",
+    });
+
+    const active = await store.getConversationBySessionKey("agent:main:main");
+    expect(active?.conversationId).toBe(original.conversationId);
+    expect(active?.active).toBe(true);
+    expect(active?.archivedAt).toBeNull();
   });
 
   it("archives the active conversation without replacement on deleted session_end", async () => {
@@ -1457,6 +1490,177 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("externalizes oversized plain user text as a raw payload", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const rawText = `${"plain raw message line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: rawText }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=user");
+      expect(messages[0].content).toContain("reason=large_raw_message");
+      expect(messages[0].content).not.toContain(rawText.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-user-payload.txt");
+      expect(storedFile!.mimeType).toBe("text/plain");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(rawText);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].textContent).toBe(messages[0].content);
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        originalRole: "user",
+        rawPayloadExternalized: true,
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(rawText, "utf8"),
+        externalizationReason: "large_raw_message",
+      });
+    });
+  });
+
+  it("keeps plain user text inline when below the raw-payload threshold", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 100_000 });
+      const sessionId = randomUUID();
+      const rawText = "short raw message";
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "user", content: rawText }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe(rawText);
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+    });
+  });
+
+  it("externalizes oversized non-file non-tool raw payloads", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const rawBlob = "RAW_VENDOR_PAYLOAD ".repeat(220);
+      const rawPayload = [{ type: "vendor_payload", blob: rawBlob, status: "ok" }];
+
+      await engine.ingest({
+        sessionId,
+        message: makeMessage({ role: "assistant", content: rawPayload }),
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toContain("[LCM Raw Payload: file_");
+      expect(messages[0].content).toContain("role=assistant");
+      expect(messages[0].content).not.toContain(rawBlob.slice(0, 64));
+
+      const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("raw-assistant-payload.json");
+      expect(storedFile!.mimeType).toBe("application/json");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(JSON.stringify(rawPayload));
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      const assembledMessage = assembled.messages[0] as {
+        role: string;
+        content?: Array<{ type?: unknown; text?: unknown }>;
+      };
+      expect(assembledMessage.role).toBe("assistant");
+      expect(assembledMessage.content?.[0]?.type).toBe("text");
+      expect(String(assembledMessage.content?.[0]?.text)).toContain("[LCM Raw Payload:");
+    });
+  });
+
+  it("does not externalize assistant tool or reasoning blocks generically", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const largeReasoning = "protected reasoning ".repeat(220);
+      const largeInput = "protected tool input ".repeat(220);
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "reasoning", summary: [{ text: largeReasoning }] },
+            {
+              type: "toolCall",
+              id: "call_protected",
+              name: "exec",
+              input: { cmd: largeInput },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const messages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+
+      const largeFiles = await engine
+        .getSummaryStore()
+        .getLargeFilesByConversation(conversation!.conversationId);
+      expect(largeFiles).toHaveLength(0);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+      expect(parts.map((part) => part.partType)).toEqual(["reasoning", "tool"]);
+      expect(parts[1].toolCallId).toBe("call_protected");
+      expect(parts[1].toolName).toBe("exec");
+    });
+  });
+
   it("stores externalized inline images under largeFilesDir", async () => {
     const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
     tempDirs.push(largeFilesDir);
@@ -1495,6 +1699,70 @@ describe("LcmContextEngine.ingest content extraction", () => {
     expect(storedFile!.storageUri).toContain(
       `${largeFilesDir}/${conversation!.conversationId}/`,
     );
+  });
+
+  it("externalizes native user image blocks before raw payload fallback", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = randomUUID();
+    const base64Image = `/9j/${"A".repeat(600)}`;
+    const userText =
+      "[media attached: /Users/example/inbound/screenshot.jpg (image/jpeg)]\nplease inspect";
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({
+        role: "user",
+        content: [
+          { type: "text", text: userText },
+          { type: "image", data: base64Image, mimeType: "image/jpeg" },
+        ],
+      }),
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("please inspect");
+    expect(messages[0].content).toContain("[User image: screenshot.jpg");
+    expect(messages[0].content).not.toContain("[LCM Raw Payload:");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const largeFiles = await engine
+      .getSummaryStore()
+      .getLargeFilesByConversation(conversation!.conversationId);
+    expect(largeFiles).toHaveLength(1);
+    expect(largeFiles[0].fileName).toBe("screenshot.jpg");
+    expect(largeFiles[0].mimeType).toBe("image/jpeg");
+    expect(readFileSync(largeFiles[0].storageUri)).toEqual(Buffer.from(base64Image, "base64"));
+
+    const parts = await engine.getConversationStore().getMessageParts(messages[0].messageId);
+    expect(parts.map((part) => part.partType)).toEqual(["text", "text"]);
+    expect(JSON.stringify(parts)).not.toContain(base64Image.slice(0, 32));
+
+    const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+    const assembled = await assembler.assemble({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 10_000,
+    });
+    const assembledUser = assembled.messages[0] as {
+      role: string;
+      content?: Array<{ type?: unknown; text?: unknown }>;
+    };
+    expect(assembledUser.role).toBe("user");
+    expect(assembledUser.content?.[0]?.text).toContain("please inspect");
+    expect(assembledUser.content?.[1]?.text).toContain("[User image: screenshot.jpg");
+    expect(JSON.stringify(assembled.messages)).not.toContain(base64Image.slice(0, 32));
   });
 
   it("externalizes oversized tool-result payloads into large_files", async () => {
@@ -2592,7 +2860,7 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(await engine.getSummaryStore().getSummary("sum_rotation_session_key_old")).not.toBeNull();
   });
 
-  it("rotates to a fresh conversation when a stable sessionKey resumes on a new transcript after the old file disappears", async () => {
+  it("preserves the rich active conversation when a stable sessionKey resumes on a new transcript after the old file disappears", async () => {
     const engine = createEngine();
     const firstSessionId = "bootstrap-missed-reset-fallback-1";
     const secondSessionId = "bootstrap-missed-reset-fallback-2";
@@ -2641,6 +2909,14 @@ describe("LcmContextEngine.bootstrap", () => {
     const secondManager = SessionManager.open(secondSessionFile);
     secondManager.appendMessage({
       role: "user",
+      content: [{ type: "text", text: "old user" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "old assistant" }],
+    } as AgentMessage);
+    secondManager.appendMessage({
+      role: "user",
       content: [{ type: "text", text: "new user" }],
     } as AgentMessage);
     secondManager.appendMessage({
@@ -2656,6 +2932,7 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(second).toEqual({
       bootstrapped: true,
       importedMessages: 2,
+      reason: "reconciled missing session messages",
     });
 
     const activeConversation = await engine.getConversationStore().getConversationForSession({
@@ -2663,31 +2940,27 @@ describe("LcmContextEngine.bootstrap", () => {
       sessionKey,
     });
     expect(activeConversation).not.toBeNull();
-    expect(activeConversation!.conversationId).not.toBe(originalConversation!.conversationId);
+    expect(activeConversation!.conversationId).toBe(originalConversation!.conversationId);
     expect(activeConversation!.sessionId).toBe(secondSessionId);
     expect(activeConversation!.active).toBe(true);
 
-    const archivedConversation = await engine.getConversationStore().getConversation(
+    const preservedConversation = await engine.getConversationStore().getConversation(
       originalConversation!.conversationId,
     );
-    expect(archivedConversation?.active).toBe(false);
-    expect(archivedConversation?.archivedAt).not.toBeNull();
+    expect(preservedConversation?.active).toBe(true);
+    expect(preservedConversation?.archivedAt).toBeNull();
 
-    const archivedMessages = await engine.getConversationStore().getMessages(
-      originalConversation!.conversationId,
-    );
-    expect(archivedMessages.map((message) => message.content)).toEqual([
-      "old user",
-      "old assistant",
-    ]);
-
-    const activeMessages = await engine.getConversationStore().getMessages(
+    const storedMessages = await engine.getConversationStore().getMessages(
       activeConversation!.conversationId,
     );
-    expect(activeMessages.map((message) => message.content)).toEqual([
+    expect(storedMessages.map((message) => message.content)).toEqual([
+      "old user",
+      "old assistant",
       "new user",
       "new assistant",
     ]);
+
+    expect(await engine.getSummaryStore().getSummary("sum_missed_reset_fallback_old")).not.toBeNull();
   });
 
   it("preserves the active conversation when the tracked transcript stat fails for a non-missing reason", async () => {
@@ -3728,16 +4001,16 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the bulk import path for initial bootstrap", async () => {
-    const sessionFile = createSessionFilePath("bulk");
+  it("uses the live ingest path for initial bootstrap", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-ingest-path");
     const sm = SessionManager.open(sessionFile);
     sm.appendMessage({
       role: "user",
-      content: [{ type: "text", text: "bulk one" }],
+      content: [{ type: "text", text: "ingest one" }],
     } as AgentMessage);
     sm.appendMessage({
       role: "assistant",
-      content: [{ type: "text", text: "bulk two" }],
+      content: [{ type: "text", text: "ingest two" }],
     } as AgentMessage);
 
     const warnLog = vi.fn();
@@ -3753,13 +4026,185 @@ describe("LcmContextEngine.bootstrap", () => {
     const singleSpy = vi.spyOn(engine.getConversationStore(), "createMessage");
 
     const result = await engine.bootstrap({
-      sessionId: "bootstrap-bulk",
+      sessionId: "bootstrap-ingest-path",
       sessionFile,
     });
 
     expect(result.bootstrapped).toBe(true);
-    expect(bulkSpy).toHaveBeenCalledTimes(1);
-    expect(singleSpy).not.toHaveBeenCalled();
+    expect(result.importedMessages).toBe(2);
+    expect(bulkSpy).not.toHaveBeenCalled();
+    expect(singleSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("externalizes oversized file blocks during first-time bootstrap and still reconciles later tail messages", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-large-file-parity");
+      const fileText = `${"bootstrap file line\n".repeat(160)}done`;
+      writeFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          role: "user",
+          content: `<file name="bootstrap.md" mime="text/markdown">${fileText}</file>`,
+        })}\n`,
+        "utf8",
+      );
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "bootstrap-large-file-parity";
+      const first = await engine.bootstrap({ sessionId, sessionFile });
+      expect(first).toEqual({
+        bootstrapped: true,
+        importedMessages: 1,
+      });
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const initiallyStored = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(initiallyStored).toHaveLength(1);
+      expect(initiallyStored[0].content).toContain("[LCM File: file_");
+      expect(initiallyStored[0].content).not.toContain("<file name=");
+      expect(initiallyStored[0].content).not.toContain(fileText.slice(0, 64));
+
+      const fileIdMatch = initiallyStored[0].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("bootstrap.md");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(fileText);
+
+      const parts = await engine.getConversationStore().getMessageParts(initiallyStored[0].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].textContent).toContain("[LCM File: file_");
+
+      appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          role: "assistant",
+          content: [{ type: "text", text: "tail after externalized bootstrap" }],
+        })}\n`,
+        "utf8",
+      );
+
+      const second = await engine.bootstrap({ sessionId, sessionFile });
+      expect(second).toEqual({
+        bootstrapped: true,
+        importedMessages: 1,
+        reason: "reconciled missing session messages",
+      });
+
+      const afterReconcile = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(afterReconcile.map((message) => message.content)).toEqual([
+        initiallyStored[0].content,
+        "tail after externalized bootstrap",
+      ]);
+    });
+  });
+
+  it("externalizes inline images during first-time bootstrap", async () => {
+    const largeFilesDir = mkdtempSync(join(tmpdir(), "lossless-claw-large-files-"));
+    tempDirs.push(largeFilesDir);
+    const sessionFile = createSessionFilePath("bootstrap-inline-image-parity");
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        role: "user",
+        content: `[media attached: bootstrap.png]\n${base64Image}\n`,
+      })}\n`,
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({
+      largeFileTokenThreshold: 20,
+      largeFilesDir,
+    });
+    const sessionId = "bootstrap-inline-image-parity";
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].content).toContain("[User image: bootstrap.png");
+    expect(messages[0].content).not.toContain(base64Image.slice(0, 32));
+
+    const fileIdMatch = messages[0].content.match(/file_[a-f0-9]{16}/);
+    expect(fileIdMatch).not.toBeNull();
+    const storedFile = await engine.getSummaryStore().getLargeFile(fileIdMatch![0]);
+    expect(storedFile).not.toBeNull();
+    expect(storedFile!.mimeType).toBe("image/png");
+    expect(storedFile!.storageUri).toContain(`${largeFilesDir}/${conversation!.conversationId}/`);
+  });
+
+  it("externalizes oversized tool results during first-time bootstrap", async () => {
+    await withTempHome(async () => {
+      const sessionFile = createSessionFilePath("bootstrap-tool-result-parity");
+      const sm = SessionManager.open(sessionFile);
+      const toolOutput = `${"bootstrap tool output\n".repeat(160)}done`;
+      sm.appendMessage({
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_bootstrap_externalized",
+            name: "exec",
+            input: { cmd: "cat large.txt" },
+          },
+        ],
+      } as AgentMessage);
+      sm.appendMessage({
+        role: "toolResult",
+        toolCallId: "call_bootstrap_externalized",
+        toolName: "exec",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_bootstrap_externalized",
+            name: "exec",
+            content: [{ type: "text", text: toolOutput }],
+          },
+        ],
+      } as AgentMessage);
+
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = "bootstrap-tool-result-parity";
+      const result = await engine.bootstrap({ sessionId, sessionFile });
+      expect(result.bootstrapped).toBe(true);
+      expect(result.importedMessages).toBe(2);
+
+      const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+      const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+      expect(messages).toHaveLength(2);
+      expect(messages[1].content).toContain("[LCM Tool Output: file_");
+      expect(messages[1].content).toContain("tool=exec");
+      expect(messages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = messages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(messages[1].messageId);
+      expect(parts).toHaveLength(1);
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+    });
   });
 
   it("limits first-time bootstrap imports to the newest messages within bootstrapMaxTokens", async () => {
@@ -4021,7 +4466,7 @@ describe("LcmContextEngine.bootstrap", () => {
 // ── Assemble canonical path with fallback ───────────────────────────────────
 
 describe("LcmContextEngine.assemble canonical path", () => {
-  it("falls back to live messages when no DB conversation exists", async () => {
+  it("strips assistant prefill tails when no DB conversation exists", async () => {
     const engine = createEngine();
     const liveMessages: AgentMessage[] = [
       { role: "user", content: "first turn" },
@@ -4034,7 +4479,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 100,
     });
 
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -4058,7 +4504,8 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 256,
     });
 
-    expect(result.messages).toBe(liveMessages);
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -4140,8 +4587,71 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 1000,
     });
 
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
+    expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("falls back to live context when assembled result has no user turns (cold-cache new session)", async () => {
+    // Reproduces the cold-cache new session scenario:
+    // Session starts with only an assistant greeting before any user message.
+    // When the cache goes cold and assemble() is called, the assembled DB context
+    // contains only the assistant greeting — no user turns.  This would cause a
+    // prefill error on providers that require conversations to end with a user message.
+    // The guard should detect the missing user turns and fall back to live context.
+    const engine = createEngine();
+    const sessionId = "session-cold-cache-no-user-turns";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "Hello! How can I help you today?" } as AgentMessage,
+    });
+
+    // Simulate the first real user message arriving (params.messages = current turn only)
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "Hi, I need help with something." },
+    ] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    // Should fall back to live context, not return the assistant-only DB context
     expect(result.messages).toBe(liveMessages);
     expect(result.estimatedTokens).toBe(0);
+  });
+
+  it("does not fall back when assembled result has user turns even if it ends with assistant", async () => {
+    // Normal session: DB has [user, assistant].  The assembled result ends with an
+    // assistant turn, but it contains user turns — this is valid because the framework
+    // appends the current user turn after the assembled context.
+    const engine = createEngine();
+    const sessionId = "session-ends-with-assistant-has-user-turns";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message one" } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "persisted message two" } as AgentMessage,
+    });
+
+    const liveMessages: AgentMessage[] = [
+      { role: "user", content: "live turn" },
+    ] as AgentMessage[];
+    const result = await engine.assemble({
+      sessionId,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+
+    // Should use the DB context (has user turns), not fall back to live
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[1].role).toBe("assistant");
   });
 
   it("drops orphan tool results during assembled transcript repair", async () => {
@@ -4385,6 +4895,54 @@ describe("LcmContextEngine.assemble canonical path", () => {
     ).toBe(true);
   });
 
+  it("assemble still forwards cache-stability options with deferred-maintenance observability", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 2,
+      freshTailMaxTokens: 123,
+      promptAwareEviction: false,
+    });
+    const privateEngine = engine as unknown as {
+      assembler: {
+        assemble: (input: unknown) => Promise<unknown>;
+      };
+    };
+    const sessionId = "session-assembly-options-stable-with-observability";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message" } as AgentMessage,
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "hot",
+      retention: "long",
+      lastObservedCacheHitAt: new Date(),
+      lastCacheTouchAt: new Date(),
+      provider: "anthropic",
+      model: "claude-opus-4-6",
+    });
+    const assembleSpy = vi.spyOn(privateEngine.assembler, "assemble");
+
+    await engine.assemble({
+      sessionId,
+      messages: [makeMessage({ role: "user", content: "live message" })],
+      tokenBudget: 10_000,
+      prompt: "persisted",
+    });
+
+    expect(assembleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        freshTailCount: 2,
+        freshTailMaxTokens: 123,
+        promptAwareEviction: false,
+        prompt: "persisted",
+        orphanStrippingOrdinal: undefined,
+      }),
+    );
+  });
+
   it("clears stable orphan stripping state when cache-aware state is cold", async () => {
     const engine = createEngine();
     const sessionId = "session-cold-cache-clears-orphan-stripping-state";
@@ -4525,6 +5083,94 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(assembleDebugLog).toContain("currentDivergenceMessage=user|content=text");
   });
 
+  it("adds compact overflow diagnostics to stressed assemble debug logs", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-overflow-diagnostics";
+    const secretMarker = "PRIVATE_OVERFLOW_MARKER";
+
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "user",
+        content: `large prompt contributor ${secretMarker} ${"x".repeat(1200)}`,
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: `second prompt contributor ${"y".repeat(600)}`,
+      } as AgentMessage,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    (
+      engine as unknown as {
+        recordRecentBootstrapImport: (
+          conversationId: number,
+          importedMessages: number,
+          reason: string | null,
+        ) => void;
+      }
+    ).recordRecentBootstrapImport(
+      conversation!.conversationId,
+      7,
+      "reconciled missing session messages",
+    );
+
+    await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 100,
+    });
+
+    const assembleDebugLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find(
+        (entry: unknown) =>
+          typeof entry === "string" &&
+          entry.includes("[lcm] assemble-debug") &&
+          entry.includes("overflowDiagnostics="),
+      ) as string | undefined;
+
+    expect(assembleDebugLog).toEqual(expect.any(String));
+    expect(assembleDebugLog).not.toContain(secretMarker);
+    const diagnostics = JSON.parse(
+      assembleDebugLog!
+        .slice(assembleDebugLog!.indexOf("overflowDiagnostics="))
+        .replace("overflowDiagnostics=", ""),
+    ) as Record<string, unknown>;
+    expect(diagnostics).toMatchObject({
+      tokenBudget: 100,
+      rawMessageCount: 2,
+      summaryCount: 0,
+      totalContextItems: 2,
+      recentBootstrapImportCount: 7,
+      recentBootstrapImportReason: "reconciled missing session messages",
+    });
+    expect(diagnostics.topMessageContributors).toEqual([
+      expect.objectContaining({
+        seq: 1,
+        role: "user",
+        selected: true,
+      }),
+      expect.objectContaining({
+        seq: 2,
+        role: "assistant",
+        selected: true,
+      }),
+    ]);
+  });
+
   it("repairs OpenAI function_call transcripts without dropping reasoning blocks", async () => {
     const engine = createEngine();
     const sessionId = "session-openai-function-call";
@@ -4582,6 +5228,49 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[1]?.role).toBe("toolResult");
     expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("fc_1");
     expect(result.messages[2]?.role).toBe("user");
+  });
+
+  it("filters thinking-only assistant messages during assembly", async () => {
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Explain the result." }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "Internal reasoning only." }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Keep reasoning with visible output." },
+          { type: "text", text: "Visible answer." },
+        ],
+      } as AgentMessage,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("user");
+    const assistant = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content?.map((block) => block.type)).toEqual(["thinking", "text"]);
+    expect(assistant.content?.[1]?.text).toBe("Visible answer.");
   });
 
   it("rebuilds raw function_call blocks from stored columns when raw arguments are objects", async () => {
@@ -6077,6 +6766,339 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.tokenBudget).toBe(400);
   });
 
+  it("afterTurn does not background-compact prompt-mutating debt while Anthropic cache is hot", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-hot-cache-deferred";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      refreshBootstrapState: (params: unknown) => Promise<void>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: false,
+      reason: "hot-cache-budget-headroom",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "high",
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 40_000,
+      cacheState: "hot",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const consumeDeferredCompactionDebtSpy = vi.spyOn(
+      privateEngine,
+      "consumeDeferredCompactionDebt",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-hot-cache-deferred"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        promptCache: {
+          retention: "long",
+          lastCallUsage: {
+            input: 8_000,
+            cacheRead: 7_000,
+            cacheWrite: 0,
+          },
+        },
+      },
+    });
+
+    await flushImmediate();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+  });
+
+  it("afterTurn treats Codex cache-write-only telemetry as mutation-sensitive", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-codex-cache-write-deferred";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      refreshBootstrapState: (params: unknown) => Promise<void>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: false,
+      reason: "hot-cache-budget-headroom",
+      maxPasses: 1,
+      allowCondensedPasses: false,
+      activityBand: "high",
+      leafChunkTokens: 40_000,
+      fallbackLeafChunkTokens: [40_000, 30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 40_000,
+      cacheState: "hot",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const consumeDeferredCompactionDebtSpy = vi.spyOn(
+      privateEngine,
+      "consumeDeferredCompactionDebt",
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-codex-cache-write-deferred"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai-codex-responses",
+        model: "gpt-5.5",
+        promptCache: {
+          retention: "short",
+          lastCallUsage: {
+            input: 8_000,
+            cacheRead: 0,
+            cacheWrite: 8_000,
+          },
+        },
+      },
+    });
+
+    await flushImmediate();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    const telemetry = await engine
+      .getCompactionTelemetryStore()
+      .getConversationCompactionTelemetry(conversation!.conversationId);
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(telemetry?.cacheState).toBe("hot");
+    expect(telemetry?.lastObservedCacheWrite).toBe(8_000);
+    expect(telemetry?.lastCacheTouchAt).toBeInstanceOf(Date);
+  });
+
+  it("afterTurn keeps deferred debt durable when background drain finds the session busy", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-busy-debt-durable";
+    const privateEngine = engine as unknown as {
+      withSessionQueue<T>(queueKey: string, operation: () => Promise<T>): Promise<T>;
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      consumeDeferredCompactionDebt: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: true,
+      reason: "leaf-trigger",
+      maxPasses: 1,
+      allowCondensedPasses: true,
+      activityBand: "medium",
+      leafChunkTokens: 30_000,
+      fallbackLeafChunkTokens: [30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 30_000,
+      cacheState: "cold",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const consumeDeferredCompactionDebtSpy = vi.spyOn(
+      privateEngine,
+      "consumeDeferredCompactionDebt",
+    );
+    let releaseRefresh!: () => void;
+    let resolveRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => {
+      resolveRefreshStarted = resolve;
+    });
+    const refreshRelease = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    vi.spyOn(privateEngine, "refreshBootstrapState").mockImplementation(async () => {
+      resolveRefreshStarted();
+      await refreshRelease;
+    });
+
+    const afterTurnPromise = engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-busy-debt-durable"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai",
+        model: "gpt-5.1",
+      },
+    });
+
+    await refreshStarted;
+    await flushImmediate();
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+
+    let releaseQueue!: () => void;
+    const heldQueue = privateEngine.withSessionQueue(sessionId, async () => {
+      await new Promise<void>((resolve) => {
+        releaseQueue = resolve;
+      });
+    });
+
+    releaseRefresh();
+    await afterTurnPromise;
+    await flushImmediate();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(consumeDeferredCompactionDebtSpy).not.toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+
+    releaseQueue();
+    await heldQueue;
+  });
+
+  it("afterTurn drains deferred debt in the background when cache policy allows it", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-background-safe-drain";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+      executeLeafCompactionCore: (params: unknown) => Promise<unknown>;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 60_000,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine, "evaluateIncrementalCompaction").mockResolvedValue({
+      shouldCompact: true,
+      reason: "cold-cache-catchup",
+      maxPasses: 2,
+      allowCondensedPasses: true,
+      activityBand: "medium",
+      leafChunkTokens: 30_000,
+      fallbackLeafChunkTokens: [30_000, 20_000],
+      rawTokensOutsideTail: 60_000,
+      threshold: 30_000,
+      cacheState: "cold",
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const executeLeafCompactionCoreSpy = vi.spyOn(
+      privateEngine,
+      "executeLeafCompactionCore",
+    ).mockResolvedValue({
+      ok: true,
+      compacted: true,
+      reason: "compacted",
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-background-safe-drain"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+      runtimeContext: {
+        provider: "openai",
+        model: "gpt-5.1",
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(executeLeafCompactionCoreSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId,
+          tokenBudget: 4_096,
+          maxPasses: 2,
+          allowCondensedPasses: true,
+        }),
+      );
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+  });
+
   it("maintain() leaves deferred compaction debt pending until the host opts in", async () => {
     const engine = createEngine();
     const sessionId = "maintain-deferred-compaction-disabled";
@@ -6228,6 +7250,205 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.running).toBe(false);
     expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
     expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() keeps deferred prompt-mutating debt pending while Codex cache is still hot", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-hot-cache";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "unknown",
+      retention: "short",
+      lastCacheTouchAt: new Date(),
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+
+    const evaluateIncrementalCompactionSpy = vi.spyOn(privateEngine, "evaluateIncrementalCompaction");
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-hot-cache"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
+    expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() lets explicit Codex cache breaks override recent cache touches", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-explicit-break";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    const now = new Date();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: now,
+      lastObservedCacheBreakAt: now,
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi
+      .spyOn(privateEngine, "evaluateIncrementalCompaction")
+      .mockResolvedValue({
+        shouldCompact: false,
+        reason: "deferred compaction no longer needed",
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        activityBand: "low",
+        leafChunkTokens: 20_000,
+        fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+        rawTokensOutsideTail: 0,
+        threshold: 20_000,
+        cacheState: "cold",
+      });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-explicit-break"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(evaluateIncrementalCompactionSpy).toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
+  });
+
+  it("maintain() treats Codex cache touches after explicit breaks as hot again", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-break-then-touch";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    const now = new Date();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: now,
+      lastObservedCacheBreakAt: new Date(now.getTime() - 1_000),
+      provider: "openai-codex-responses",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi.spyOn(privateEngine, "evaluateIncrementalCompaction");
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-break-then-touch"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+    expect(maintenance?.running).toBe(false);
+    expect(evaluateIncrementalCompactionSpy).not.toHaveBeenCalled();
+    expect(maintenanceResult.changed).toBe(false);
+  });
+
+  it("maintain() consumes deferred Codex debt after the prompt cache TTL expires", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      evaluateIncrementalCompaction: (params: unknown) => Promise<unknown>;
+    };
+    const sessionId = "maintain-deferred-compaction-codex-stale-cache";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {
+      sessionKey: undefined,
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 42,
+    });
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation.conversationId,
+      cacheState: "cold",
+      retention: "short",
+      lastCacheTouchAt: new Date(Date.now() - 10 * 60 * 1000),
+      provider: "github-copilot",
+      model: "gpt-5.5",
+    });
+    const evaluateIncrementalCompactionSpy = vi
+      .spyOn(privateEngine, "evaluateIncrementalCompaction")
+      .mockResolvedValue({
+        shouldCompact: false,
+        reason: "deferred compaction no longer needed",
+        maxPasses: 1,
+        allowCondensedPasses: false,
+        activityBand: "low",
+        leafChunkTokens: 20_000,
+        fallbackLeafChunkTokens: [20_000, 15_000, 10_000],
+        rawTokensOutsideTail: 0,
+        threshold: 20_000,
+        cacheState: "cold",
+      });
+
+    const maintenanceResult = await engine.maintain({
+      sessionId,
+      sessionFile: createSessionFilePath("maintain-deferred-compaction-codex-stale-cache"),
+      runtimeContext: {
+        allowDeferredCompactionExecution: true,
+      },
+    });
+
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(evaluateIncrementalCompactionSpy).toHaveBeenCalled();
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+    expect(maintenanceResult.reason).toBe("deferred compaction no longer needed");
   });
 
   it("maintain() treats a recent Anthropic API call as a hot-cache touch when explicit cache telemetry is absent", async () => {
@@ -6760,6 +7981,62 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
   });
 
+  it("afterTurn prefers runtime prompt tokens over transcript estimates for compaction decisions", async () => {
+    const debugLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: debugLog,
+        },
+      },
+    );
+    const sessionId = "after-turn-runtime-prompt-tokens";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    const evaluateSpy = vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 204_800,
+      threshold: 98_304,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-runtime-prompt-tokens"),
+      messages: [makeMessage({ role: "assistant", content: "small transcript estimate" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 128_000,
+      runtimeContext: {
+        usage: {
+          prompt_tokens: 204_800,
+        },
+      },
+    });
+
+    expect(evaluateSpy).toHaveBeenCalledWith(expect.any(Number), expect.any(Number), 204_800);
+    expect(debugLog).toHaveBeenCalledWith(
+      expect.stringContaining("using runtime prompt token count currentTokenCount=204800"),
+    );
+  });
+
   it("evaluateIncrementalCompaction skips hot-cache maintenance when real budget headroom is comfortable", async () => {
     const infoLog = vi.fn();
     const engine = createEngineWithDeps(
@@ -6937,6 +8214,92 @@ describe("LcmContextEngine fidelity and token budget", () => {
     );
     expect(infoLog).toHaveBeenCalledWith(
       expect.stringContaining("cacheReadSharePct=15.0%"),
+    );
+  });
+
+  it("evaluateIncrementalCompaction keeps cache-write-only telemetry hot", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: {
+          info: infoLog,
+          warn: vi.fn(),
+          error: vi.fn(),
+          debug: vi.fn(),
+        },
+      },
+    );
+    const sessionId = "incremental-cache-write-only-hot";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number, leafChunkTokens?: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      evaluateIncrementalCompaction: (params: {
+        conversationId: number;
+        tokenBudget: number;
+        currentTokenCount?: number;
+      }) => Promise<{
+        shouldCompact: boolean;
+        cacheState: string;
+        allowCondensedPasses: boolean;
+      }>;
+    };
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "seed" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine.getCompactionTelemetryStore().upsertConversationCompactionTelemetry({
+      conversationId: conversation!.conversationId,
+      cacheState: "hot",
+      lastObservedCacheRead: 0,
+      lastObservedCacheWrite: 8_000,
+      lastObservedPromptTokenCount: 16_000,
+      lastCacheTouchAt: new Date(),
+      turnsSinceLeafCompaction: 1,
+      tokensAccumulatedSinceLeafCompaction: 55_000,
+      lastActivityBand: "low",
+    });
+
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockImplementation(
+      async (_conversationId: number, leafChunkTokens?: number) => ({
+        shouldCompact: true,
+        rawTokensOutsideTail: 55_000,
+        threshold: leafChunkTokens ?? 20_000,
+      }),
+    );
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "none",
+      currentTokens: 12_000,
+      threshold: 75_000,
+    });
+
+    const decision = await privateEngine.evaluateIncrementalCompaction({
+      conversationId: conversation!.conversationId,
+      tokenBudget: 100_000,
+      currentTokenCount: 12_000,
+    });
+
+    expect(decision.shouldCompact).toBe(false);
+    expect(decision.cacheState).toBe("hot");
+    expect(decision.allowCondensedPasses).toBe(false);
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("reason=hot-cache-budget-headroom"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheReadSharePct=0.0%"),
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      expect.stringContaining("cacheWrite=8000"),
     );
   });
 
@@ -8152,6 +9515,102 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     ]);
   });
 
+  it("skips fully replayed suffix batches when the stored prefix is absent", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-full-suffix-replay";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-full-suffix-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old B" }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-full-suffix-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "compacted old A" }),
+        makeMessage({ role: "user", content: "old B" }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old B", "old C"]);
+  });
+
+  it("uses the actual stored tail for oversized single-message replays", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-oversized-single-tail";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-single-tail"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-single-tail-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old C" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+  });
+
+  it("does not treat a one-message terminal match as a fully replayed batch", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-terminal-single-match";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-terminal-single-match"),
+      messages: [makeMessage({ role: "assistant", content: "same answer" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-terminal-single-match-2"),
+      messages: [
+        makeMessage({ role: "user", content: "new question" }),
+        makeMessage({ role: "assistant", content: "same answer" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "same answer",
+      "new question",
+      "same answer",
+    ]);
+  });
+
   it("ingests single genuinely new message without dedup interference", async () => {
     const engine = createEngine();
     const sessionId = "dedup-single";
@@ -9280,5 +10739,285 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
         tokenBudget: 4096,
       }),
     );
+  });
+
+
+  it("compact() marks only affected visibility root indices stale after content changes", async () => {
+    const engine = createEngineWithConfig({
+      rootSummary: {
+        enabled: true,
+        maxTokens: 2000,
+        scope: "user",
+        minAgeMinutes: 0,
+        customInstructions: "",
+      },
+      visibility: {
+        enabled: true,
+        rules: [],
+        defaultPolicy: "owner-only",
+        userIdSource: "sender-id",
+        channelMembers: {
+          "123456": ["111111"],
+          "999999": ["222222"],
+        },
+      },
+    });
+    const sessionId = "root-summary-stale-after-compact";
+    const sessionKey = "agent:main:discord:channel:123456";
+
+    engine.getRootSummaryStore().upsert({
+      rootKey: "channel:123456",
+      content: "old root",
+      tokenCount: 2,
+      sourceConversationIds: [],
+    });
+    engine.getRootSummaryStore().upsert({
+      rootKey: "channel:999999",
+      content: "unaffected root",
+      tokenCount: 3,
+      sourceConversationIds: [],
+    });
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "alpha ".repeat(800) }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "bravo ".repeat(800) }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "charlie ".repeat(800) }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("root-summary-stale-after-compact"),
+      tokenBudget: 1000,
+      force: true,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(engine.getRootSummaryStore().get("channel:123456")?.stale).toBe(true);
+    expect(engine.getRootSummaryStore().get("channel:999999")?.stale).toBe(false);
+  });
+
+  it("compact() marks same-audience root indices stale when a session becomes newly indexable", async () => {
+    const engine = createEngineWithConfig({
+      rootSummary: {
+        enabled: true,
+        maxTokens: 2000,
+        scope: "user",
+        minAgeMinutes: 0,
+        customInstructions: "",
+      },
+      visibility: {
+        enabled: true,
+        rules: [],
+        defaultPolicy: "owner-only",
+        userIdSource: "sender-id",
+        channelMembers: {
+          "123456": ["111111", "222222"],
+          "789012": ["111111", "222222"],
+          "999999": ["333333"],
+        },
+      },
+    });
+    const db = (engine.getConversationStore() as unknown as {
+      db: {
+        exec: (sql: string) => void;
+        prepare: (sql: string) => { run: (...args: unknown[]) => void };
+      };
+    }).db;
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS channel_membership (
+        channel_id TEXT PRIMARY KEY,
+        is_open INTEGER NOT NULL DEFAULT 0,
+        member_ids TEXT NOT NULL DEFAULT '[]',
+        discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        source TEXT NOT NULL DEFAULT 'manual',
+        channel_name TEXT,
+        guild_id TEXT
+      )
+    `);
+    for (const [channelId, members] of [
+      ["123456", ["111111", "222222"]],
+      ["789012", ["111111", "222222"]],
+      ["999999", ["333333"]],
+    ] as const) {
+      db.prepare(
+        "INSERT OR REPLACE INTO channel_membership (channel_id, is_open, member_ids, channel_name, guild_id) VALUES (?, 0, ?, ?, ?)",
+      ).run(channelId, JSON.stringify(members), channelId, "guild-1");
+    }
+
+    engine.getRootSummaryStore().upsert({
+      rootKey: "channel:123456",
+      content: "existing peer root that did not yet list the changed conversation",
+      tokenCount: 10,
+      sourceConversationIds: [],
+    });
+    engine.getRootSummaryStore().upsert({
+      rootKey: "channel:999999",
+      content: "narrower root",
+      tokenCount: 2,
+      sourceConversationIds: [],
+    });
+
+    const sessionId = "root-summary-stale-newly-indexable";
+    const sessionKey = "agent:main:discord:channel:789012";
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "alpha ".repeat(800) }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "assistant", content: "bravo ".repeat(800) }),
+    });
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "charlie ".repeat(800) }),
+    });
+
+    const result = await engine.compact({
+      sessionId,
+      sessionKey,
+      sessionFile: createSessionFilePath("root-summary-stale-newly-indexable"),
+      tokenBudget: 1000,
+      force: true,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(engine.getRootSummaryStore().get("channel:123456")?.stale).toBe(true);
+    expect(engine.getRootSummaryStore().get("channel:999999")?.stale).toBe(false);
+  });
+
+  it("compactLeafAsync marks existing root indices stale after leaf compaction", async () => {
+    const engine = createEngineWithConfig({
+      freshTailCount: 0,
+      leafChunkTokens: 100,
+      rootSummary: {
+        enabled: true,
+        maxTokens: 2000,
+        scope: "user",
+        minAgeMinutes: 0,
+        customInstructions: "",
+      },
+    });
+    const sessionId = "root-summary-stale-after-leaf";
+
+    engine.getRootSummaryStore().upsert({
+      rootKey: "111111",
+      content: "old root",
+      tokenCount: 2,
+      sourceConversationIds: [],
+    });
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "delta ".repeat(200) }),
+    });
+
+    const result = await engine.compactLeafAsync({
+      sessionId,
+      sessionFile: createSessionFilePath("root-summary-stale-after-leaf"),
+      tokenBudget: 1000,
+      leafChunkTokens: 100,
+      force: true,
+      legacyParams: {
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+      },
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(engine.getRootSummaryStore().get("111111")).toBeNull();
+  });
+
+  it("assemble regenerates and injects a stale root index on demand", async () => {
+    const engine = createEngineWithConfig({
+      rootSummary: {
+        enabled: true,
+        maxTokens: 2000,
+        scope: "user",
+        minAgeMinutes: 0,
+        customInstructions: "",
+      },
+      visibility: {
+        enabled: true,
+        rules: [],
+        defaultPolicy: "owner-only",
+        userIdSource: "sender-id",
+        channelMembers: {
+          "123456": ["111111"],
+        },
+      },
+    });
+    const sessionId = "root-summary-on-demand-session";
+    const sessionKey = "agent:main:discord:channel:123456";
+
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({
+        role: "user",
+        content: '{"sender_id":"111111"}\nvisible root source',
+      }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({ sessionId, sessionKey });
+    expect(conversation).not.toBeNull();
+
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_root_on_demand",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "root frontier content",
+      tokenCount: 5,
+    });
+    await engine.getSummaryStore().appendContextSummary(conversation!.conversationId, "sum_root_on_demand");
+
+    engine.getRootSummaryStore().upsert({
+      rootKey: "channel:123456",
+      content: "stale old root index",
+      tokenCount: 4,
+      sourceConversationIds: [],
+    });
+    engine.getRootSummaryStore().markStale("channel:123456");
+
+    const assembled = await engine.assemble({
+      sessionId,
+      sessionKey,
+      currentUserId: "111111",
+      messages: [makeMessage({ role: "user", content: "live prompt" })],
+      tokenBudget: 4000,
+    });
+
+    const regeneratedRoot = engine.getRootSummaryStore().get("channel:123456");
+    expect(regeneratedRoot).not.toBeNull();
+    expect(regeneratedRoot?.stale).toBe(false);
+    expect(regeneratedRoot?.content).toContain("Visibility-Scope Memory Root Index (channel:123456)");
+    expect(regeneratedRoot?.content).not.toContain("stale old root index");
+    const assembledText = assembled.messages
+      .map((message) => (typeof message.content === "string" ? message.content : ""))
+      .join("\n");
+    expect(assembledText).toContain("Visibility-Scope Memory Root Index (channel:123456)");
+    expect(assembledText).not.toContain("stale old root index");
   });
 });

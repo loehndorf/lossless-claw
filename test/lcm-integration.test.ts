@@ -174,7 +174,7 @@ function createMockConversationStore() {
         // Simple in-memory search: check if content includes the query string
         filtered = filtered.filter((m) => m.content.includes(input.query));
         return filtered
-          .toSorted((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+          .slice().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
           .slice(0, limit)
           .map((m) => ({
             messageId: m.messageId,
@@ -214,7 +214,7 @@ function createMockSummaryStore() {
     getContextItems: vi.fn(async (conversationId: number): Promise<ContextItemRecord[]> => {
       return contextItems
         .filter((ci) => ci.conversationId === conversationId)
-        .toSorted((a, b) => a.ordinal - b.ordinal);
+        .slice().sort((a, b) => a.ordinal - b.ordinal);
     }),
 
     getDistinctDepthsInContext: vi.fn(
@@ -244,7 +244,7 @@ function createMockSummaryStore() {
           }
           distinctDepths.add(summary.depth);
         }
-        return [...distinctDepths].toSorted((a, b) => a - b);
+        return [...distinctDepths].slice().sort((a, b) => a - b);
       },
     ),
 
@@ -317,7 +317,7 @@ function createMockSummaryStore() {
         // Resequence: sort by ordinal then reassign dense ordinals 0..n-1
         const convItems = contextItems
           .filter((ci) => ci.conversationId === conversationId)
-          .toSorted((a, b) => a.ordinal - b.ordinal);
+          .slice().sort((a, b) => a.ordinal - b.ordinal);
 
         // Remove all conversation items, re-add with new ordinals
         for (let i = contextItems.length - 1; i >= 0; i--) {
@@ -396,7 +396,7 @@ function createMockSummaryStore() {
     getSummariesByConversation: vi.fn(async (conversationId: number): Promise<SummaryRecord[]> => {
       return summaries
         .filter((s) => s.conversationId === conversationId)
-        .toSorted((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        .slice().sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
     }),
 
     // ── Lineage ─────────────────────────────────────────────────────────
@@ -426,7 +426,7 @@ function createMockSummaryStore() {
     getSummaryMessages: vi.fn(async (summaryId: string): Promise<number[]> => {
       return summaryMessages
         .filter((sm) => sm.summaryId === summaryId)
-        .toSorted((a, b) => a.ordinal - b.ordinal)
+        .slice().sort((a, b) => a.ordinal - b.ordinal)
         .map((sm) => sm.messageId);
     }),
 
@@ -434,7 +434,7 @@ function createMockSummaryStore() {
       const parentIds = new Set(
         summaryParents
           .filter((sp) => sp.summaryId === summaryId)
-          .toSorted((a, b) => a.ordinal - b.ordinal)
+          .slice().sort((a, b) => a.ordinal - b.ordinal)
           .map((sp) => sp.parentSummaryId),
       );
       return summaries.filter((s) => parentIds.has(s.summaryId));
@@ -444,7 +444,7 @@ function createMockSummaryStore() {
       const childIds = new Set(
         summaryParents
           .filter((sp) => sp.parentSummaryId === parentSummaryId)
-          .toSorted((a, b) => a.ordinal - b.ordinal)
+          .slice().sort((a, b) => a.ordinal - b.ordinal)
           .map((sp) => sp.summaryId),
       );
       return summaries.filter((s) => childIds.has(s.summaryId));
@@ -482,7 +482,7 @@ function createMockSummaryStore() {
         }
         const children = summaryParents
           .filter((edge) => edge.parentSummaryId === current.summaryId)
-          .toSorted((a, b) => a.ordinal - b.ordinal);
+          .slice().sort((a, b) => a.ordinal - b.ordinal);
         output.push({
           ...summary,
           depthFromRoot: current.depthFromRoot,
@@ -530,7 +530,7 @@ function createMockSummaryStore() {
         // Simple in-memory search
         filtered = filtered.filter((s) => s.content.includes(input.query));
         return filtered
-          .toSorted((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+          .slice().sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
           .slice(0, limit)
           .map((s) => ({
             summaryId: s.summaryId,
@@ -797,6 +797,90 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(summaryMsg).toBeDefined();
     expect(summaryMsg!.role).toBe("user");
     expect(summaryMsg!.content).toContain("This is a leaf summary");
+  });
+
+  it("emits depersonalized overflow diagnostics with top contributors", async () => {
+    const [small, large, duplicate] = await ingestMessages(convStore, sumStore, 3, {
+      contentFn: (i) => {
+        if (i === 0) return "tiny";
+        if (i === 1) return `large message ${"x".repeat(800)}`;
+        return `repeated content ${"y".repeat(120)}`;
+      },
+      tokenCountFn: (_i, content) => estimateTokens(content),
+    });
+    const duplicateText = duplicate.content;
+    const secondDuplicate = await convStore.createMessage({
+      conversationId: CONV_ID,
+      seq: 4,
+      role: "assistant",
+      content: duplicateText,
+      tokenCount: estimateTokens(duplicateText),
+    });
+    await sumStore.appendContextMessage(CONV_ID, secondDuplicate.messageId);
+
+    const summaryId = "sum_overflow_diag";
+    await sumStore.insertSummary({
+      summaryId,
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: `summary contributor ${"z".repeat(500)}`,
+      tokenCount: 125,
+    });
+    await sumStore.appendContextSummary(CONV_ID, summaryId);
+    sumStore._contextItems.push({
+      conversationId: CONV_ID,
+      ordinal: 5,
+      itemType: "message",
+      messageId: large.messageId,
+      summaryId: null,
+      createdAt: new Date(),
+    });
+
+    const result = await assembler.assemble({
+      conversationId: CONV_ID,
+      tokenBudget: 150,
+      freshTailCount: 1,
+    });
+
+    const diagnostics = result.debug?.overflowDiagnostics;
+    expect(diagnostics).toMatchObject({
+      tokenBudget: 150,
+      rawMessageCount: 5,
+      summaryCount: 1,
+      totalContextItems: 6,
+    });
+    expect(diagnostics?.rawMessageTokens).toBeGreaterThan(diagnostics?.summaryTokens ?? 0);
+    expect(diagnostics?.duplicateRefClusters).toEqual([
+      expect.objectContaining({
+        kind: "message-ref",
+        count: 2,
+        ordinals: [1, 5],
+        seqs: [2, 2],
+      }),
+    ]);
+    expect(diagnostics?.duplicateMessageClusters).toContainEqual(
+      expect.objectContaining({
+        kind: "message-content",
+        count: 2,
+        seqs: [2, 2],
+      }),
+    );
+    expect(diagnostics?.topMessageContributors[0]).toMatchObject({
+      messageId: large.messageId,
+      seq: 2,
+      role: "assistant",
+    });
+    expect(diagnostics?.topMessageContributors[0]?.tokens).toBeGreaterThanOrEqual(
+      diagnostics?.topMessageContributors[1]?.tokens ?? 0,
+    );
+    expect(diagnostics?.topSummaryContributors[0]).toMatchObject({
+      summaryId,
+      summaryKind: "leaf",
+      summaryDepth: 0,
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("large message");
+    expect(JSON.stringify(diagnostics)).not.toContain("summary contributor");
+    expect(small.messageId).toBeGreaterThan(0);
   });
 
   it("empty conversation returns empty result", async () => {
@@ -1255,6 +1339,90 @@ describe("LCM integration: compaction", () => {
 
     // Total context items should be fewer than the original 10
     expect(contextItems.length).toBeLessThan(10);
+  });
+
+  it("leaf compaction strips thinking/reasoning blocks from the summarizer input", async () => {
+    // Ingest a mix of messages: some with thinking blocks only, some with visible text,
+    // and some with both thinking blocks and visible text.
+    const thinkingOnlyContent = JSON.stringify([
+      { type: "thinking", thinking: "", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_abc", encrypted_content: "ENCRYPTED_PAYLOAD_XXXX" }) },
+    ]);
+    const mixedContent = JSON.stringify([
+      { type: "thinking", thinking: "Let me reason...", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_xyz", encrypted_content: "ANOTHER_ENCRYPTED" }) },
+      { type: "text", text: "Visible assistant reply." },
+    ]);
+    const reasoningTextContent = JSON.stringify([
+      { type: "reasoning", text: "PRIVATE_REASONING_TEXT" },
+      { type: "text", text: "Visible reply after reasoning text." },
+    ]);
+    const thinkingSummaryContent = JSON.stringify([
+      { type: "thinking", summary: "PRIVATE_THINKING_SUMMARY" },
+      { type: "text", text: "Visible reply after thinking summary." },
+    ]);
+    const plainContent = "A plain user message.";
+
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => plainContent,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingOnlyContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => mixedContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => reasoningTextContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    await ingestMessages(convStore, sumStore, 1, {
+      contentFn: () => thinkingSummaryContent,
+      roleFn: () => "assistant",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+    // Add extra user messages to cross the compaction threshold
+    await ingestMessages(convStore, sumStore, 7, {
+      contentFn: (i) => `Follow-up message ${i}`,
+      roleFn: () => "user",
+      tokenCountFn: (_i, c) => estimateTokens(c),
+    });
+
+    let capturedSourceText = "";
+    const summarize = vi.fn(async (text: string) => {
+      capturedSourceText = text;
+      return "Leaf summary.";
+    });
+
+    await compactionEngine.compact({
+      conversationId: CONV_ID,
+      tokenBudget: 10_000,
+      summarize,
+      force: true,
+    });
+
+    expect(summarize).toHaveBeenCalled();
+
+    // Thinking block types and encrypted signatures must not appear in the summarizer input
+    expect(capturedSourceText).not.toContain("thinkingSignature");
+    expect(capturedSourceText).not.toContain("ENCRYPTED_PAYLOAD_XXXX");
+    expect(capturedSourceText).not.toContain("ANOTHER_ENCRYPTED");
+    expect(capturedSourceText).not.toContain('"type":"thinking"');
+    expect(capturedSourceText).not.toContain("PRIVATE_REASONING_TEXT");
+    expect(capturedSourceText).not.toContain("PRIVATE_THINKING_SUMMARY");
+
+    // The visible text from the mixed-content message must still be present
+    expect(capturedSourceText).toContain("Visible assistant reply.");
+    expect(capturedSourceText).toContain("Visible reply after reasoning text.");
+    expect(capturedSourceText).toContain("Visible reply after thinking summary.");
+
+    // The plain user message must still be present
+    expect(capturedSourceText).toContain("A plain user message.");
   });
 
   it("leaf-trigger accounting respects fresh tail token caps", async () => {
@@ -1888,7 +2056,7 @@ describe("LCM integration: compaction", () => {
     expect(result.actionTaken).toBe(true);
     const parentIds = sumStore._summaryParents
       .filter((edge) => edge.summaryId === result.createdSummaryId)
-      .toSorted((a, b) => a.ordinal - b.ordinal)
+      .slice().sort((a, b) => a.ordinal - b.ordinal)
       .map((edge) => edge.parentSummaryId);
     expect(parentIds).toEqual(["sum_break_leaf_1", "sum_break_leaf_2"]);
   });
@@ -2588,6 +2756,45 @@ describe("LCM integration: retrieval", () => {
     expect(result!.file!.storageUri).toBe("s3://bucket/data.csv");
   });
 
+  it("describe returns null for summaries outside allowed conversations", async () => {
+    await sumStore.insertSummary({
+      summaryId: "sum_allowed",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: "Allowed summary.",
+      tokenCount: 5,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_forbidden",
+      conversationId: 99,
+      kind: "leaf",
+      content: "Forbidden summary.",
+      tokenCount: 5,
+    });
+
+    await sumStore.linkSummaryToParents("sum_forbidden", ["sum_allowed"]);
+
+    expect(await retrieval.describe("sum_forbidden", [CONV_ID])).toBeNull();
+    const allowed = await retrieval.describe("sum_allowed", [CONV_ID]);
+    expect(allowed).not.toBeNull();
+    expect(allowed!.summary!.childIds).toEqual([]);
+    expect(allowed!.summary!.subtree.map((node) => node.summaryId)).toEqual(["sum_allowed"]);
+  });
+
+  it("describe returns null for files outside allowed conversations", async () => {
+    await sumStore.insertLargeFile({
+      fileId: "file_forbidden",
+      conversationId: 99,
+      fileName: "secret.txt",
+      mimeType: "text/plain",
+      byteSize: 12,
+      storageUri: "file:///secret.txt",
+      explorationSummary: "Forbidden file.",
+    });
+
+    expect(await retrieval.describe("file_forbidden", [CONV_ID])).toBeNull();
+  });
+
   it("describe returns null for unknown IDs", async () => {
     const result = await retrieval.describe("sum_nonexistent");
     expect(result).toBeNull();
@@ -2859,6 +3066,73 @@ describe("LCM integration: retrieval", () => {
     expect(result.messages[0].content).toBe("Source message 0");
     expect(result.messages[1].content).toBe("Source message 1");
     expect(result.messages[2].content).toBe("Source message 2");
+  });
+
+  it("expand filters out child summaries outside allowed conversations", async () => {
+    await sumStore.insertSummary({
+      summaryId: "sum_allowed_child",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: "Allowed child.",
+      tokenCount: 10,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_forbidden_child",
+      conversationId: 99,
+      kind: "leaf",
+      content: "Forbidden child.",
+      tokenCount: 10,
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_visibility_parent",
+      conversationId: CONV_ID,
+      kind: "condensed",
+      content: "Parent summary.",
+      tokenCount: 5,
+    });
+    await sumStore.linkSummaryToParents("sum_visibility_parent", [
+      "sum_allowed_child",
+      "sum_forbidden_child",
+    ]);
+
+    const result = await retrieval.expand({
+      summaryId: "sum_visibility_parent",
+      depth: 1,
+      allowedConversationIds: [CONV_ID],
+    });
+
+    expect(result.children.map((child) => child.summaryId)).toEqual(["sum_allowed_child"]);
+  });
+
+  it("expand filters out source messages outside allowed conversations", async () => {
+    const allowed = await ingestMessages(convStore, sumStore, 1, {
+      conversationId: CONV_ID,
+      contentFn: () => "Allowed source message",
+    });
+    const forbidden = await ingestMessages(convStore, sumStore, 1, {
+      conversationId: 99,
+      contentFn: () => "Forbidden source message",
+    });
+    await sumStore.insertSummary({
+      summaryId: "sum_mixed_messages",
+      conversationId: CONV_ID,
+      kind: "leaf",
+      content: "Leaf summary with mixed message links.",
+      tokenCount: 10,
+    });
+    await sumStore.linkSummaryToMessages("sum_mixed_messages", [
+      allowed[0].messageId,
+      forbidden[0].messageId,
+    ]);
+
+    const result = await retrieval.expand({
+      summaryId: "sum_mixed_messages",
+      depth: 1,
+      includeMessages: true,
+      allowedConversationIds: [CONV_ID],
+    });
+
+    expect(result.messages.map((message) => message.content)).toEqual(["Allowed source message"]);
   });
 
   it("expand recurses through multiple depth levels", async () => {

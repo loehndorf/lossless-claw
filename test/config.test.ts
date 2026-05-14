@@ -53,6 +53,13 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 40000,
     });
+    expect(config.rootSummary).toEqual({
+      enabled: false,
+      maxTokens: 2000,
+      scope: "user",
+      minAgeMinutes: 0,
+      customInstructions: "",
+    });
   });
 
   it("reads values from plugin config", () => {
@@ -84,6 +91,29 @@ describe("resolveLcmConfig", () => {
       dynamicLeafChunkTokens: {
         enabled: true,
         max: 50000,
+      },
+      rootSummary: {
+        enabled: true,
+        maxTokens: 1234,
+        minAgeMinutes: 15,
+        customInstructions: "prefer concise bullets",
+      },
+      visibility: {
+        enabled: true,
+        rules: [
+          {
+            sessionPattern: "agent:*:discord:direct:*",
+            allowedUsers: [],
+            label: "open test rule",
+          },
+        ],
+        defaultPolicy: "owner-only",
+        userIdSource: "sender-id",
+        channelMembers: {
+          "open-channel": null,
+          "restricted-empty": [],
+          "restricted-channel": ["user-1"],
+        },
       },
     });
     expect(config.enabled).toBe(false);
@@ -117,6 +147,30 @@ describe("resolveLcmConfig", () => {
       enabled: true,
       max: 80000,
     });
+    expect(config.rootSummary).toEqual({
+      enabled: true,
+      maxTokens: 1234,
+      scope: "user",
+      minAgeMinutes: 15,
+      customInstructions: "prefer concise bullets",
+    });
+    expect(config.visibility).toEqual({
+      enabled: true,
+      rules: [
+        {
+          sessionPattern: "agent:*:discord:direct:*",
+          allowedUsers: [],
+          label: "open test rule",
+        },
+      ],
+      defaultPolicy: "owner-only",
+      userIdSource: "sender-id",
+      channelMembers: {
+        "open-channel": null,
+        "restricted-empty": [],
+        "restricted-channel": ["user-1"],
+      },
+    });
   });
 
   it("env vars override plugin config", () => {
@@ -141,6 +195,10 @@ describe("resolveLcmConfig", () => {
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
       LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
       LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE: "inline",
+      LCM_ROOT_SUMMARY_ENABLED: "true",
+      LCM_ROOT_SUMMARY_MAX_TOKENS: "4321",
+      LCM_ROOT_SUMMARY_MIN_AGE_MINUTES: "30",
+      LCM_ROOT_SUMMARY_CUSTOM_INSTRUCTIONS: "env root instructions",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -165,6 +223,12 @@ describe("resolveLcmConfig", () => {
       dynamicLeafChunkTokens: {
         enabled: false,
         max: 50000,
+      },
+      rootSummary: {
+        enabled: false,
+        maxTokens: 1234,
+        minAgeMinutes: 15,
+        customInstructions: "plugin root instructions",
       },
     };
     const config = resolveLcmConfig(env, pluginConfig);
@@ -197,6 +261,13 @@ describe("resolveLcmConfig", () => {
     expect(config.dynamicLeafChunkTokens).toEqual({
       enabled: true,
       max: 60000,
+    });
+    expect(config.rootSummary).toEqual({
+      enabled: true,
+      maxTokens: 4321,
+      scope: "user",
+      minAgeMinutes: 30,
+      customInstructions: "env root instructions",
     });
   });
 
@@ -772,6 +843,51 @@ describe("resolveLcmConfig largeFilesDir", () => {
       { largeFilesDir: "/plugin/files" },
     );
     expect(config.largeFilesDir).toBe("/env/files");
+  });
+});
+
+describe("resolveLcmConfig nightlyCompactHour", () => {
+  it("defaults to 4 when not configured", () => {
+    const config = resolveLcmConfig({}, {});
+    expect(config.nightlyCompactHour).toBe(4);
+  });
+
+  it("reads LCM_NIGHTLY_COMPACT_HOUR from env", () => {
+    const config = resolveLcmConfig(
+      { LCM_NIGHTLY_COMPACT_HOUR: "2" } as NodeJS.ProcessEnv,
+      {},
+    );
+    expect(config.nightlyCompactHour).toBe(2);
+  });
+
+  it("reads nightlyCompaction.hour from plugin config", () => {
+    const config = resolveLcmConfig({}, { nightlyCompaction: { hour: 22 } });
+    expect(config.nightlyCompaction.hour).toBe(22);
+    expect(config.nightlyCompactHour).toBe(22);
+  });
+
+  it("keeps nightlyCompactHour as a backward-compatible plugin config alias", () => {
+    const config = resolveLcmConfig({}, { nightlyCompactHour: 21 });
+    expect(config.nightlyCompaction.hour).toBe(21);
+  });
+
+  it("reads nightlyCompaction.enabled from plugin config and env", () => {
+    expect(resolveLcmConfig({}, { nightlyCompaction: { enabled: true } }).nightlyCompaction.enabled).toBe(true);
+    expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_ENABLED: "true" } as NodeJS.ProcessEnv, {}).nightlyCompaction.enabled).toBe(true);
+    expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_ENABLED: "false" } as NodeJS.ProcessEnv, { nightlyCompaction: { enabled: true } }).nightlyCompaction.enabled).toBe(false);
+  });
+
+  it("env overrides plugin config", () => {
+    const config = resolveLcmConfig(
+      { LCM_NIGHTLY_COMPACTION_HOUR: "3" } as NodeJS.ProcessEnv,
+      { nightlyCompaction: { hour: 22 } },
+    );
+    expect(config.nightlyCompaction.hour).toBe(3);
+  });
+
+  it("clamps to 0–23 range", () => {
+    expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_HOUR: "-1" } as NodeJS.ProcessEnv, {}).nightlyCompaction.hour).toBe(0);
+    expect(resolveLcmConfig({ LCM_NIGHTLY_COMPACTION_HOUR: "25" } as NodeJS.ProcessEnv, {}).nightlyCompaction.hour).toBe(23);
   });
 });
 

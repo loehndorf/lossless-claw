@@ -3,7 +3,8 @@ import type { LcmContextEngine } from "../engine.js";
 import type { LcmDependencies } from "../types.js";
 import type { AnyAgentTool } from "./common.js";
 import { jsonResult } from "./common.js";
-import { parseIsoTimestampParam, resolveLcmConversationScope } from "./lcm-conversation-scope.js";
+import { parseIsoTimestampParam } from "./lcm-conversation-scope.js";
+import { resolveVisibilityScopedConversations } from "./lcm-visibility-scope.js";
 import { formatTimestamp } from "../compaction.js";
 
 const MAX_RESULT_CHARS = 40_000; // ~10k tokens
@@ -93,6 +94,8 @@ export function createLcmGrepTool(input: {
   getLcm?: () => Promise<LcmContextEngine>;
   sessionId?: string;
   sessionKey?: string;
+  senderId?: string;
+  getSessionUserIds?: () => Map<string, string> | undefined;
 }): AnyAgentTool {
   return {
     name: "lcm_grep",
@@ -134,14 +137,19 @@ export function createLcmGrepTool(input: {
           error: "`since` must be earlier than `before`.",
         });
       }
-      const conversationScope = await resolveLcmConversationScope({
+      const visibilityScope = await resolveVisibilityScopedConversations({
         lcm,
         deps: input.deps,
         sessionId: input.sessionId,
         sessionKey: input.sessionKey,
         params: p,
+        senderId: input.senderId,
+        getSessionUserIds: input.getSessionUserIds,
       });
-      if (!conversationScope.allConversations && conversationScope.conversationId == null) {
+      if (visibilityScope.error) {
+        return jsonResult({ error: visibilityScope.error });
+      }
+      if (!visibilityScope.allConversations && visibilityScope.conversationId == null) {
         return jsonResult({
           error:
             "No LCM conversation found for this session. Provide conversationId or set allConversations=true.",
@@ -151,7 +159,8 @@ export function createLcmGrepTool(input: {
         query: pattern,
         mode,
         scope,
-        conversationId: conversationScope.conversationId,
+        conversationId: visibilityScope.conversationId,
+        allowedConversationIds: visibilityScope.allowedConversationIds,
         limit,
         since,
         before,
@@ -162,10 +171,10 @@ export function createLcmGrepTool(input: {
       lines.push("## LCM Grep Results");
       lines.push(`**Pattern:** \`${pattern}\``);
       lines.push(`**Mode:** ${mode} | **Scope:** ${scope} | **Sort:** ${effectiveSort}`);
-      if (conversationScope.allConversations) {
+      if (visibilityScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
-      } else if (conversationScope.conversationId != null) {
-        lines.push(`**Conversation scope:** ${conversationScope.conversationId}`);
+      } else if (visibilityScope.conversationId != null) {
+        lines.push(`**Conversation scope:** ${visibilityScope.conversationId}`);
       }
       if (since || before) {
         lines.push(
