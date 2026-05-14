@@ -54,6 +54,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryDepths: 1,
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
+  invalidateScopedRootIndicesForStrictVisibility: 1,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -759,6 +760,17 @@ function getExistingTableNames(db: DatabaseSync, names: string[]): Set<string> {
   );
 }
 
+function invalidateScopedRootIndicesForStrictVisibility(db: DatabaseSync): void {
+  if (!getExistingTableNames(db, ["root_summaries"]).has("root_summaries")) {
+    return;
+  }
+
+  // Root indices are derived navigation data. Rebuild existing rows once after
+  // tightening visibility/guild scoping so a clean install cannot keep injecting
+  // a permissive index materialized by older code.
+  db.exec(`UPDATE root_summaries SET stale = 1`);
+}
+
 function getFtsShadowTableNames(tableName: string): string[] {
   return [
     `${tableName}_data`,
@@ -1114,6 +1126,9 @@ export function runLcmMigrations(
     );
     runVersionedBackfillStep(db, "backfillToolCallColumns", log, () =>
       backfillToolCallColumns(db),
+    );
+    runVersionedBackfillStep(db, "invalidateScopedRootIndicesForStrictVisibility", log, () =>
+      invalidateScopedRootIndicesForStrictVisibility(db),
     );
 
     const detectedFeatures = options?.fts5Available === false ? null : getLcmDbFeatures(db);

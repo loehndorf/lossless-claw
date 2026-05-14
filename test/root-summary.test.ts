@@ -405,10 +405,10 @@ describe("root index regeneration", () => {
     const db = createRootSummaryTestDb();
     const rootStore = new RootSummaryStore(db);
 
-    db.prepare("INSERT INTO channel_membership (channel_id, member_ids, channel_name) VALUES (?, ?, ?)")
-      .run("123456789", JSON.stringify(["111111"]), "dev");
-    db.prepare("INSERT INTO channel_membership (channel_id, member_ids, channel_name) VALUES (?, ?, ?)")
-      .run("987654321", JSON.stringify(["111111"]), "Openclaw Support");
+    db.prepare("INSERT INTO channel_membership (channel_id, member_ids, channel_name, guild_id) VALUES (?, ?, ?, ?)")
+      .run("123456789", JSON.stringify(["111111"]), "dev", "guild-1");
+    db.prepare("INSERT INTO channel_membership (channel_id, member_ids, channel_name, guild_id) VALUES (?, ?, ?, ?)")
+      .run("987654321", JSON.stringify(["111111"]), "Openclaw Support", "guild-1");
     db.prepare("INSERT INTO conversations (session_id, session_key, created_at) VALUES (?, ?, ?)")
       .run("thread-session", "agent:main:discord:channel:123456789:topic:987654321", "2026-05-01T00:00:00Z");
     const conversationId = Number((db.prepare("SELECT last_insert_rowid() AS id").get() as any).id);
@@ -901,6 +901,55 @@ describe("root index regeneration", () => {
     expect(root?.content).toContain('id: "333333333"');
     expect(root?.content).not.toContain('id: "444444444"');
     expect(root?.content).not.toContain('id: "555555555"');
+
+    db.close();
+  });
+
+  it("fails closed for cross-channel root entries when guild id is unknown", () => {
+    const db = createRootSummaryTestDb();
+    const rootStore = new RootSummaryStore(db);
+
+    const insertConversation = (sessionId: string, sessionKey: string, summaryId: string, summary: string) => {
+      db.prepare("INSERT INTO conversations (session_id, session_key, created_at) VALUES (?, ?, ?)")
+        .run(sessionId, sessionKey, "2026-05-01T00:00:00Z");
+      const conversationId = Number((db.prepare("SELECT last_insert_rowid() AS id").get() as any).id);
+      db.prepare("INSERT INTO messages (conversation_id, seq, role, content) VALUES (?, ?, ?, ?)")
+        .run(conversationId, 1, "user", "hello");
+      db.prepare("INSERT INTO summaries (summary_id, conversation_id, kind, depth, content, token_count) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(summaryId, conversationId, "leaf", 0, summary, 5);
+      db.prepare("INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id) VALUES (?, ?, ?, ?)")
+        .run(conversationId, 1, "summary", summaryId);
+      return conversationId;
+    };
+
+    const currentId = insertConversation(
+      "current", "agent:main:discord:channel:111111111", "sum_current_unknown_guild", "current channel context"
+    );
+    const sameAudienceUnknownGuildId = insertConversation(
+      "unknown-guild", "agent:main:discord:channel:222222222", "sum_unknown_guild", "unknown guild channel must not appear"
+    );
+
+    for (const [channelId, memberIds, name] of [
+      ["111111111", JSON.stringify(["111111", "222222"]), "current"],
+      ["222222222", JSON.stringify(["111111", "222222"]), "unknown-guild"],
+    ] as const) {
+      db.prepare("INSERT INTO channel_membership (channel_id, is_open, member_ids, channel_name, guild_id) VALUES (?, ?, ?, ?, ?)")
+        .run(channelId, 0, memberIds, name, null);
+    }
+
+    regenerateStaleRoots(rootStore, db, {
+      ...visibility,
+      channelMembers: {
+        "111111111": ["111111", "222222"],
+        "222222222": ["111111", "222222"],
+      },
+    }, rootConfig, "UTC");
+
+    const root = rootStore.get("channel:111111111");
+    expect(root?.sourceConversationIds).toEqual([currentId]);
+    expect(root?.sourceConversationIds).not.toContain(sameAudienceUnknownGuildId);
+    expect(root?.content).not.toContain('id: "222222222"');
+    expect(root?.content).not.toContain("unknown guild channel must not appear");
 
     db.close();
   });
