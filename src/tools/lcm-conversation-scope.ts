@@ -98,9 +98,12 @@ export async function resolveLcmConversationScope(input: {
   }
 
   const normalizedSessionKey = input.sessionKey?.trim();
-  if (normalizedSessionKey) {
+  const canonicalSessionKey = normalizedSessionKey
+    ? lcm.resolveCanonicalSessionKeyForLookup(normalizedSessionKey)?.trim() || normalizedSessionKey
+    : undefined;
+  if (canonicalSessionKey) {
     const bySessionKey =
-      await lcm.getConversationStore().getConversationBySessionKey(normalizedSessionKey);
+      await lcm.getConversationStore().getConversationBySessionKey(canonicalSessionKey);
     if (bySessionKey) {
       return { conversationId: bySessionKey.conversationId, allConversations: false };
     }

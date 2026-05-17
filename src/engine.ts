@@ -2048,8 +2048,8 @@ export class LcmContextEngine implements ContextEngine {
    * The topic_id is extracted from message metadata (the inbound JSON block)
    * that OpenClaw injects into user messages.
    *
-   * Example: `agent:main:discord:channel:100000000000000010`
-   *       → `agent:main:discord:channel:100000000000000010:topic:100000000000000010`
+   * Example: `agent:main:discord:channel:<parentChannelId>`
+   *       → `agent:main:discord:channel:<parentChannelId>:topic:<threadId>`
    *
    * Only channel sessions are enhanced. DMs, subagents, and already-enhanced
    * keys pass through unchanged.
@@ -2116,23 +2116,27 @@ export class LcmContextEngine implements ContextEngine {
     // Runtime sometimes provides the Discord thread id as the channel id; when
     // topic_id is the same id, still resolve the real parent from thread_label
     // and rewrite to channel:<parent>:topic:<thread>.
-    const channelMatch = sessionKey.match(/^agent:main:discord:channel:(\d+)(?::topic:(\d+))?$/);
+    const channelMatch = sessionKey.match(/^agent:([^:]+):discord:channel:(\d+)(?::topic:(\d+))?$/);
     if (!channelMatch) return sessionKey;
 
-    const topicId = this.extractTopicIdFromText(messageContent) ?? channelMatch[2];
-    if (!topicId) return sessionKey;
+    const agentId = channelMatch[1]!;
+    const channelId = channelMatch[2]!;
+    const existingTopicId = channelMatch[3];
+    const topicId = this.extractTopicIdFromText(messageContent) ?? existingTopicId;
+    if (!topicId) return this.resolveCanonicalSessionKeyForLookup(sessionKey) ?? sessionKey;
 
     const parentChannelId = this.resolveDiscordParentChannelIdFromText(messageContent);
     if (parentChannelId) {
-      return `agent:main:discord:channel:${parentChannelId}:topic:${topicId}`;
+      return `agent:${agentId}:discord:channel:${parentChannelId}:topic:${topicId}`;
     }
 
-    if (channelMatch[1] === topicId) {
-      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId);
+    if (channelId === topicId) {
+      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId, agentId);
       if (canonical) return canonical;
+      return sessionKey;
     }
 
-    if (channelMatch[2]) return sessionKey;
+    if (existingTopicId) return sessionKey;
     return `${sessionKey}:topic:${topicId}`;
   }
 
@@ -2179,20 +2183,40 @@ export class LcmContextEngine implements ContextEngine {
    */
   private enhanceSessionKeyFromMessages(sessionKey: string | undefined, messages: AgentMessage[]): string | undefined {
     if (!sessionKey) return sessionKey;
-    const channelMatch = sessionKey.match(/^agent:main:discord:channel:(\d+)(?::topic:(\d+))?$/);
+    const channelMatch = sessionKey.match(/^agent:([^:]+):discord:channel:(\d+)(?::topic:(\d+))?$/);
     if (!channelMatch) return sessionKey;
-    const topicId = this.extractTopicIdFromMessages(messages) ?? channelMatch[2];
-    if (!topicId) return sessionKey;
+    const agentId = channelMatch[1]!;
+    const channelId = channelMatch[2]!;
+    const existingTopicId = channelMatch[3];
+    const topicId = this.extractTopicIdFromMessages(messages) ?? existingTopicId;
+    if (!topicId) return this.resolveCanonicalSessionKeyForLookup(sessionKey) ?? sessionKey;
     const parentChannelId = this.resolveDiscordParentChannelIdFromMessages(messages);
     if (parentChannelId) {
-      return `agent:main:discord:channel:${parentChannelId}:topic:${topicId}`;
+      return `agent:${agentId}:discord:channel:${parentChannelId}:topic:${topicId}`;
     }
-    if (channelMatch[1] === topicId) {
-      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId);
+    if (channelId === topicId) {
+      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId, agentId);
       if (canonical) return canonical;
+      return sessionKey;
     }
-    if (channelMatch[2]) return sessionKey;
+    if (existingTopicId) return sessionKey;
     return `${sessionKey}:topic:${topicId}`;
+  }
+
+  resolveCanonicalSessionKeyForLookup(sessionKey: string | undefined): string | undefined {
+    const trimmed = sessionKey?.trim();
+    if (!trimmed) return sessionKey;
+
+    const channelMatch = trimmed.match(/^agent:([^:]+):discord:channel:(\d+)(?::topic:(\d+))?$/);
+    if (!channelMatch) return trimmed;
+
+    const agentId = channelMatch[1]!;
+    const channelId = channelMatch[2]!;
+    const topicId = channelMatch[3];
+    if (topicId && channelId !== topicId) return trimmed;
+
+    const candidateTopicId = topicId ?? channelId;
+    return this.resolveCanonicalDiscordThreadSessionKeyFromDb(candidateTopicId, agentId) ?? trimmed;
   }
 
   /**
@@ -2202,8 +2226,14 @@ export class LcmContextEngine implements ContextEngine {
    * use that as the fallback discriminator so manual compaction stays scoped to
    * the thread conversation instead of the parent channel conversation.
    */
-  private resolveCanonicalDiscordThreadSessionKeyFromDb(topicId: string): string | null {
+  private resolveCanonicalDiscordThreadSessionKeyFromDb(topicId: string, agentId?: string): string | null {
     try {
+      const agentPattern = agentId?.trim()
+        ? `agent:${agentId.trim()}:discord:channel:%:topic:${topicId}`
+        : `agent:%:discord:channel:%:topic:${topicId}`;
+      const selfPattern = agentId?.trim()
+        ? `agent:${agentId.trim()}:discord:channel:${topicId}:topic:${topicId}`
+        : `agent:%:discord:channel:${topicId}:topic:${topicId}`;
       const row = this.db.prepare(
         `SELECT session_key
          FROM conversations
@@ -2213,7 +2243,7 @@ export class LcmContextEngine implements ContextEngine {
                   (SELECT COUNT(*) FROM messages WHERE messages.conversation_id = conversations.conversation_id) DESC,
                   conversation_id DESC
          LIMIT 1`,
-      ).get(`agent:main:discord:channel:%:topic:${topicId}`, `agent:main:discord:channel:${topicId}:topic:${topicId}`) as { session_key?: string } | undefined;
+      ).get(agentPattern, selfPattern) as { session_key?: string } | undefined;
       return typeof row?.session_key === "string" && row.session_key.trim() ? row.session_key.trim() : null;
     } catch {
       return null;
@@ -2230,26 +2260,28 @@ export class LcmContextEngine implements ContextEngine {
     const provider = params.provider?.trim().toLowerCase();
     const threadId = params.threadId?.trim() || params.channelId?.trim();
     if (provider !== "discord" || !threadId) return sessionKey;
-    const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(threadId);
+    const agentId = sessionKey?.match(/^agent:([^:]+):/)?.[1];
+    const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(threadId, agentId);
     return canonical ?? sessionKey;
   }
 
   private enhanceSessionKeyFromSessionFile(sessionKey: string | undefined, sessionFile: string | undefined): string | undefined {
     if (!sessionKey) return sessionKey;
-    const channelMatch = sessionKey.match(/^agent:main:discord:channel:(\d+)$/);
+    const channelMatch = sessionKey.match(/^agent:([^:]+):discord:channel:(\d+)$/);
     if (!channelMatch) return sessionKey;
     const fileName = sessionFile ? basename(sessionFile) : "";
     const topicMatch = fileName.match(/(?:^|-)topic-(\d+)(?:[.-]|$)/);
-    if (!topicMatch) return sessionKey;
+    if (!topicMatch) return this.resolveCanonicalSessionKeyForLookup(sessionKey) ?? sessionKey;
     const topicId = topicMatch[1];
     // When OpenClaw reports the Discord thread id as the channel id and no
     // current message metadata is available, recover the canonical
     // parent-channel key from existing LCM conversations. Otherwise we create a duplicate
     // channel:<thread>:topic:<thread> conversation next to the real
     // channel:<parent>:topic:<thread> conversation.
-    if (channelMatch[1] === topicId) {
-      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId);
+    if (channelMatch[2] === topicId) {
+      const canonical = this.resolveCanonicalDiscordThreadSessionKeyFromDb(topicId, channelMatch[1]);
       if (canonical) return canonical;
+      return sessionKey;
     }
     return `${sessionKey}:topic:${topicId}`;
   }
