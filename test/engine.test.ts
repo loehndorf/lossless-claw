@@ -17,6 +17,7 @@ import {
   resolveDelegatedExpansionGrantId,
 } from "../src/expansion-auth.js";
 import { RetrievalEngine } from "../src/retrieval.js";
+import { resolveLcmConversationScope } from "../src/tools/lcm-conversation-scope.js";
 import type { LcmDependencies } from "../src/types.js";
 
 const tempDirs: string[] = [];
@@ -971,6 +972,52 @@ describe("ConversationStore session reuse", () => {
     const resolved = await store.getConversationBySessionKey(canonicalSessionKey);
     expect(resolved?.conversationId).toBe(canonicalConversation.conversationId);
     expect(resolved?.sessionId).toBe("runtime-after-new");
+  });
+
+  it("resolves tool scope to the canonical Discord thread when a raw active row shares the runtime session", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+    const runtimeSessionId = "runtime-discord-thread";
+    const canonicalSessionKey =
+      "agent:main:discord:channel:1111111111111111111:topic:2222222222222222222";
+    const rawThreadSessionKey = "agent:main:discord:channel:2222222222222222222";
+
+    const canonicalConversation = await store.createConversation({
+      sessionId: runtimeSessionId,
+      sessionKey: canonicalSessionKey,
+    });
+    await store.createMessage({
+      conversationId: canonicalConversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "canonical thread memory",
+      tokenCount: 5,
+    });
+    const rawConversation = await store.createConversation({
+      sessionId: runtimeSessionId,
+      sessionKey: rawThreadSessionKey,
+    });
+    await store.createMessage({
+      conversationId: rawConversation.conversationId,
+      seq: 1,
+      role: "system",
+      content: "raw startup row",
+      tokenCount: 3,
+    });
+
+    const scope = await resolveLcmConversationScope({
+      lcm: engine,
+      params: {},
+      sessionId: runtimeSessionId,
+      sessionKey: rawThreadSessionKey,
+    });
+
+    expect(scope).toEqual({
+      conversationId: canonicalConversation.conversationId,
+      allConversations: false,
+    });
+    expect(scope.conversationId).not.toBe(rawConversation.conversationId);
   });
 });
 
