@@ -961,6 +961,31 @@ describe("ConversationStore session reuse", () => {
     expect(resolved?.sessionId).toBe("runtime-after-new");
     expect(await store.getMessageCount(canonicalConversation.conversationId)).toBe(2);
   });
+
+  it("bootstraps collapsed Discord thread sessions into the canonical parent-topic conversation", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+    const canonicalSessionKey =
+      "agent:main:discord:channel:1111111111111111111:topic:2222222222222222222";
+    const rawThreadSessionKey = "agent:main:discord:channel:2222222222222222222";
+    const canonicalConversation = await store.getOrCreateConversation("runtime-before-new", {
+      sessionKey: canonicalSessionKey,
+    });
+    const sessionFile = createSessionFilePath("discord-thread-new-bootstrap");
+    writeFileSync(sessionFile, "");
+
+    await engine.bootstrap({
+      sessionId: "runtime-after-new",
+      sessionKey: rawThreadSessionKey,
+      sessionFile,
+    });
+
+    expect(await store.getConversationBySessionKey(rawThreadSessionKey)).toBeNull();
+    const resolved = await store.getConversationBySessionKey(canonicalSessionKey);
+    expect(resolved?.conversationId).toBe(canonicalConversation.conversationId);
+    expect(resolved?.sessionId).toBe("runtime-after-new");
+  });
 });
 
 describe("LcmContextEngine before_reset lifecycle", () => {
