@@ -244,15 +244,18 @@ export async function resolveRequesterConversationScopeId(params: {
       ) => Promise<{ conversationId: number } | null>;
     };
 
+    const canonicalRequesterSessionKey =
+      params.lcm.resolveCanonicalSessionKeyForLookup(requesterSessionKey)?.trim() || requesterSessionKey;
+
     if (typeof store.getConversationForSession === "function") {
       const conversation = await store.getConversationForSession({
-        sessionKey: requesterSessionKey,
+        sessionKey: canonicalRequesterSessionKey,
       });
       if (conversation) {
         return conversation.conversationId;
       }
     } else if (typeof store.getConversationBySessionKey === "function") {
-      const byKey = await store.getConversationBySessionKey(requesterSessionKey);
+      const byKey = await store.getConversationBySessionKey(canonicalRequesterSessionKey);
       if (byKey) {
         return byKey.conversationId;
       }
