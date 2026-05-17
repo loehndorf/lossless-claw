@@ -909,6 +909,44 @@ describe("ConversationStore session reuse", () => {
     const refreshed = await store.getConversation(conv1.conversationId);
     expect(refreshed?.sessionId).toBe("uuid-2");
   });
+
+  it("reuses the canonical Discord parent-topic conversation when a new session reports only the thread id", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+    const canonicalSessionKey =
+      "agent:main:discord:channel:1111111111111111111:topic:2222222222222222222";
+    const rawThreadSessionKey = "agent:main:discord:channel:2222222222222222222";
+
+    const canonicalConversation = await store.getOrCreateConversation("runtime-before-new", {
+      sessionKey: canonicalSessionKey,
+    });
+    await store.createMessage({
+      conversationId: canonicalConversation.conversationId,
+      seq: 1,
+      role: "user",
+      content: "existing long-running thread memory",
+      tokenCount: 5,
+    });
+
+    await engine.ingest({
+      sessionId: "runtime-after-new",
+      sessionKey: rawThreadSessionKey,
+      message: makeMessage({
+        role: "user",
+        content: [
+          '{"topic_id":"2222222222222222222","sender_id":"42"}',
+          "Synthetic recall token 4711",
+        ].join("\n"),
+      }),
+    });
+
+    expect(await store.getConversationBySessionKey(rawThreadSessionKey)).toBeNull();
+    const resolved = await store.getConversationBySessionKey(canonicalSessionKey);
+    expect(resolved?.conversationId).toBe(canonicalConversation.conversationId);
+    expect(resolved?.sessionId).toBe("runtime-after-new");
+    expect(await store.getMessageCount(canonicalConversation.conversationId)).toBe(2);
+  });
 });
 
 describe("LcmContextEngine before_reset lifecycle", () => {

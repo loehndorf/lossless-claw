@@ -85,12 +85,17 @@ function buildLcmEngine(params: {
   };
   conversationId?: number;
   conversationIdBySessionKey?: number;
+  conversationIdsBySessionKey?: Record<string, number>;
+  canonicalSessionKeyByLookup?: Record<string, string>;
   timezone?: string;
 }) {
   return {
     info: { id: "lcm", name: "LCM", version: "0.0.0" },
     timezone: params.timezone ?? "UTC",
     getRetrieval: () => params.retrieval,
+    resolveCanonicalSessionKeyForLookup: vi.fn((sessionKey?: string) =>
+      sessionKey ? (params.canonicalSessionKeyByLookup?.[sessionKey] ?? sessionKey) : sessionKey,
+    ),
     getConversationStore: () => ({
       getConversationBySessionId: vi.fn(async () =>
         params.conversationId == null
@@ -104,19 +109,21 @@ function buildLcmEngine(params: {
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationBySessionKey: vi.fn(async () =>
-        params.conversationIdBySessionKey == null
+      getConversationBySessionKey: vi.fn(async (sessionKey: string) => {
+        const mappedConversationId = params.conversationIdsBySessionKey?.[sessionKey]
+          ?? params.conversationIdBySessionKey;
+        return mappedConversationId == null
           ? null
           : {
-              conversationId: params.conversationIdBySessionKey,
+              conversationId: mappedConversationId,
               sessionId: "legacy-session",
-              sessionKey: "agent:main:main",
+              sessionKey,
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
-            },
-      ),
+            };
+      }),
     }),
   };
 }
@@ -288,6 +295,45 @@ describe("LCM tools session scoping", () => {
     expect(retrieval.grep).toHaveBeenCalledWith(
       expect.objectContaining({
         conversationId: 42,
+      }),
+    );
+  });
+
+  it("lcm_grep canonicalizes collapsed Discord thread session keys before scoped lookup", async () => {
+    const canonicalSessionKey =
+      "agent:main:discord:channel:1111111111111111111:topic:2222222222222222222";
+    const rawThreadSessionKey = "agent:main:discord:channel:2222222222222222222";
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps({
+        resolveSessionIdFromSessionKey: vi.fn(async () => "runtime-after-new"),
+      }),
+      lcm: buildLcmEngine({
+        retrieval,
+        canonicalSessionKeyByLookup: {
+          [rawThreadSessionKey]: canonicalSessionKey,
+        },
+        conversationIdsBySessionKey: {
+          [rawThreadSessionKey]: 257,
+          [canonicalSessionKey]: 205,
+        },
+      }) as never,
+      sessionKey: rawThreadSessionKey,
+    });
+    await tool.execute("call-discord-thread", { pattern: "memory-token-4711" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 205,
       }),
     );
   });
