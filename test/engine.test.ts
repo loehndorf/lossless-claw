@@ -71,6 +71,20 @@ function createTestConfig(databasePath: string): LcmConfig {
       enabled: true,
       max: 40_000,
     },
+    vectorSearch: {
+      enabled: false,
+      provider: "ollama",
+      model: "bge-m3",
+      baseUrl: undefined,
+      dimensions: undefined,
+      scope: "summaries",
+      store: "sqlite",
+      hybridWeight: 0.35,
+      maxCandidates: 80,
+      indexBatchSize: 32,
+      timeoutMs: 30_000,
+      apiKey: undefined,
+    },
   };
 }
 
