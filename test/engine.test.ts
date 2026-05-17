@@ -1019,6 +1019,45 @@ describe("ConversationStore session reuse", () => {
     });
     expect(scope.conversationId).not.toBe(rawConversation.conversationId);
   });
+
+  it("does not fall back to the raw Discord thread row after a canonicalized scope lookup misses", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const store = engine.getConversationStore();
+    const runtimeSessionId = "runtime-discord-thread-canonical-miss";
+    const canonicalSessionKey =
+      "agent:main:discord:channel:1111111111111111111:topic:2222222222222222222";
+    const rawThreadSessionKey = "agent:main:discord:channel:2222222222222222222";
+
+    const canonicalConversation = await store.createConversation({
+      sessionId: runtimeSessionId,
+      sessionKey: canonicalSessionKey,
+    });
+    const rawConversation = await store.createConversation({
+      sessionId: runtimeSessionId,
+      sessionKey: rawThreadSessionKey,
+    });
+    (engine as unknown as { db: import("node:sqlite").DatabaseSync }).db
+      .prepare(
+        `UPDATE conversations
+         SET active = 0, archived_at = datetime('now')
+         WHERE conversation_id = ?`,
+      )
+      .run(canonicalConversation.conversationId);
+
+    const scope = await resolveLcmConversationScope({
+      lcm: engine,
+      params: {},
+      sessionId: runtimeSessionId,
+      sessionKey: rawThreadSessionKey,
+    });
+
+    expect(scope).toEqual({
+      conversationId: undefined,
+      allConversations: false,
+    });
+    expect(scope.conversationId).not.toBe(rawConversation.conversationId);
+  });
 });
 
 describe("LcmContextEngine before_reset lifecycle", () => {

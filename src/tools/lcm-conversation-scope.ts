@@ -14,26 +14,55 @@ type ConversationScopeStore = ReturnType<LcmContextEngine["getConversationStore"
   getConversationBySessionKey?: (sessionKey: string) => Promise<{ conversationId: number } | null>;
 };
 
+function resolveToolScopeSessionKey(input: {
+  lcm: LcmContextEngine;
+  sessionKey?: string;
+}): {
+  originalSessionKey?: string;
+  lookupSessionKey?: string;
+  canonicalized: boolean;
+} {
+  const originalSessionKey = input.sessionKey?.trim();
+  if (!originalSessionKey) {
+    return { canonicalized: false };
+  }
+
+  const lookupSessionKey =
+    input.lcm.resolveCanonicalSessionKeyForLookup(originalSessionKey)?.trim() || originalSessionKey;
+  return {
+    originalSessionKey,
+    lookupSessionKey,
+    canonicalized: lookupSessionKey !== originalSessionKey,
+  };
+}
+
 async function lookupConversationForSession(input: {
   lcm: LcmContextEngine;
   sessionId?: string;
   sessionKey?: string;
 }): Promise<{ conversationId: number } | null> {
   const store = input.lcm.getConversationStore() as ConversationScopeStore;
+  const scopeKey = resolveToolScopeSessionKey({
+    lcm: input.lcm,
+    sessionKey: input.sessionKey,
+  });
+
+  if (scopeKey.lookupSessionKey && typeof store.getConversationBySessionKey === "function") {
+    const byKey = await store.getConversationBySessionKey(scopeKey.lookupSessionKey);
+    if (byKey) {
+      return byKey;
+    }
+  }
+
+  if (scopeKey.canonicalized) {
+    return null;
+  }
 
   if (typeof store.getConversationForSession === "function") {
     return store.getConversationForSession({
       sessionId: input.sessionId,
-      sessionKey: input.sessionKey,
+      sessionKey: scopeKey.lookupSessionKey,
     });
-  }
-
-  const normalizedSessionKey = input.sessionKey?.trim();
-  if (normalizedSessionKey && typeof store.getConversationBySessionKey === "function") {
-    const byKey = await store.getConversationBySessionKey(normalizedSessionKey);
-    if (byKey) {
-      return byKey;
-    }
   }
 
   const normalizedSessionId = input.sessionId?.trim();
@@ -97,23 +126,27 @@ export async function resolveLcmConversationScope(input: {
     return { conversationId: undefined, allConversations: true };
   }
 
-  const normalizedSessionKey = input.sessionKey?.trim();
-  const canonicalSessionKey = normalizedSessionKey
-    ? lcm.resolveCanonicalSessionKeyForLookup(normalizedSessionKey)?.trim() || normalizedSessionKey
-    : undefined;
-  if (canonicalSessionKey) {
+  const scopeKey = resolveToolScopeSessionKey({
+    lcm,
+    sessionKey: input.sessionKey,
+  });
+  if (scopeKey.lookupSessionKey) {
     const bySessionKey =
-      await lcm.getConversationStore().getConversationBySessionKey(canonicalSessionKey);
+      await lcm.getConversationStore().getConversationBySessionKey(scopeKey.lookupSessionKey);
     if (bySessionKey) {
       return { conversationId: bySessionKey.conversationId, allConversations: false };
     }
   }
 
   let normalizedSessionId = input.sessionId?.trim();
-  if (!normalizedSessionId && normalizedSessionKey && input.deps) {
-    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(normalizedSessionKey);
+  if (!normalizedSessionId && scopeKey.originalSessionKey && input.deps) {
+    normalizedSessionId = await input.deps.resolveSessionIdFromSessionKey(scopeKey.originalSessionKey);
   }
-  if (!normalizedSessionId && !input.sessionKey?.trim()) {
+  if (!normalizedSessionId && !scopeKey.originalSessionKey) {
+    return { conversationId: undefined, allConversations: false };
+  }
+
+  if (scopeKey.canonicalized) {
     return { conversationId: undefined, allConversations: false };
   }
 

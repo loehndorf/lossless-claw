@@ -246,6 +246,7 @@ export async function resolveRequesterConversationScopeId(params: {
 
     const canonicalRequesterSessionKey =
       params.lcm.resolveCanonicalSessionKeyForLookup(requesterSessionKey)?.trim() || requesterSessionKey;
+    const requesterSessionKeyWasCanonicalized = canonicalRequesterSessionKey !== requesterSessionKey;
 
     if (typeof store.getConversationForSession === "function") {
       const conversation = await store.getConversationForSession({
@@ -259,6 +260,10 @@ export async function resolveRequesterConversationScopeId(params: {
       if (byKey) {
         return byKey.conversationId;
       }
+    }
+
+    if (requesterSessionKeyWasCanonicalized) {
+      return undefined;
     }
 
     const runtimeSessionId = await params.deps.resolveSessionIdFromSessionKey(requesterSessionKey);
